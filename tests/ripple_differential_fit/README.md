@@ -4,21 +4,45 @@ Differential fitting of a ripple gravitational-wave waveform to H1/L1
 strain data. Chirp mass is recovered via gradient descent on the matched-
 filter log-likelihood; network SNR is tracked along the trajectory.
 
+Upstream dataset generator [`GWDatasetGeneration`](https://github.com/chreissel/GWDatasetGeneration)
+is vendored as a git submodule under `GWDatasetGeneration/` and is used to
+produce the fit input.
+
 ## Install
 
 ```
+git submodule update --init
 pip install -r requirements.txt
 ```
 
 `ripplegw` pulls in JAX. Install a matching `jax[cuda]` wheel first if you
-want GPU acceleration.
+want GPU acceleration. `ml4gw` pulls in PyTorch and is only needed for the
+data-generation wrapper, not for the fit itself.
+
+## Generate fit input from GWDatasetGeneration
+
+Upstream writes batched, *whitened* time series (`sig_{i}.h5`, `bkg_{i}.h5`).
+The differential fit needs a single event with raw strain, PSD, and antenna
+factors. Use `generate_fit_input.py` — it reuses the waveform + PSD path
+from the submodule but skips whitening and adds the missing fields:
+
+```
+python generate_fit_input.py \
+    --config GWDatasetGeneration/configs/config_BBH.yaml \
+    --data   /path/to/background_data \
+    --out    data.h5
+```
+
+Download background data once with the submodule's `load_data.py`. Truth
+parameters sampled during generation are preserved under `/truth` in the
+output HDF5 for comparison against the fit.
 
 ## Input data
 
-The script reads a single HDF5 file produced elsewhere (e.g. by an injection
-pipeline) that contains both detectors' *time-domain* strain (signal +
-background), their PSDs on the matching rFFT grid, and the antenna-pattern
-factors for the source sky location and time.
+`fit_waveform.py` reads a single HDF5 file (e.g. produced by
+`generate_fit_input.py` above) that contains both detectors' *time-domain*
+strain (signal + background), their PSDs on the matching rFFT grid, and
+the antenna-pattern factors for the source sky location and time.
 
 ```
 /H1/strain                     float64   [N]         time-domain strain at H1

@@ -1,0 +1,3 @@
+[submodule "tests/ripple_differential_fit/GWDatasetGeneration"]
+	path = tests/ripple_differential_fit/GWDatasetGeneration
+	url = https://github.com/chreissel/GWDatasetGeneration.git

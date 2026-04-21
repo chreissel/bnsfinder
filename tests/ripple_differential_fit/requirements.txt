@@ -6,3 +6,7 @@ h5py
 numpy
 scipy
 matplotlib
+torch
+ml4gw
+pyyaml
+tqdm
