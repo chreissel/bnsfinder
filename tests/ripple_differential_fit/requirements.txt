@@ -1,0 +1,7 @@
+jax
+jaxlib
+ripplegw
+optax
+h5py
+numpy
+matplotlib
