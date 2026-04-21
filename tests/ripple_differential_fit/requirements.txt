@@ -4,4 +4,5 @@ ripplegw
 optax
 h5py
 numpy
+scipy
 matplotlib

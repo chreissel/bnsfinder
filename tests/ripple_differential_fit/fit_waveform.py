@@ -1,23 +1,28 @@
-"""Differential fit of a ripple waveform to H1/L1 strain.
+"""Differential fit of a ripple waveform to H1/L1 time-series strain.
 
 Pipeline
 --------
-1. Read pre-generated LIGO signal+background for H1 and L1 from HDF5.
-2. Generate a frequency-domain waveform (h+, hx) with ripple.
-3. Project to each detector via its antenna-pattern factors (F+, Fx).
-4. Fit chirp mass via JAX gradient descent on the matched-filter
+1. Read pre-generated LIGO signal+background *time series* for H1 and L1.
+2. Window and rFFT each detector's strain to the frequency domain.
+3. Generate a frequency-domain waveform (h+, hx) with ripple on the rFFT grid.
+4. Project to each detector via its antenna-pattern factors (F+, Fx).
+5. Fit chirp mass via JAX gradient descent on the matched-filter
    log-likelihood; track network SNR at every step.
-5. Plot SNR vs chirp mass across the fitting trajectory.
+6. Plot SNR vs chirp mass across the fitting trajectory.
 
 Expected HDF5 layout for `--data`:
 
-    /freqs                         float64 [Nf]      one-sided frequency grid (Hz)
-    /H1/strain                     complex128 [Nf]   signal + background, freq domain
-    /H1/psd                        float64 [Nf]      one-sided PSD on /freqs
+    /H1/strain                     float64 [N]        time-domain strain (signal + background)
+    /H1/psd                        float64 [N//2+1]   one-sided PSD on the rFFT grid
     /L1/strain, /L1/psd            same as H1
-    /antenna/H1/fplus,  /fcross    scalar float      antenna pattern factors
+    /antenna/H1/fplus,  /fcross    scalar float       antenna-pattern factors
     /antenna/L1/fplus,  /fcross    scalar float
-    attrs: f_ref (Hz)
+    attrs:
+        sample_rate (Hz)           scalar             time-series sample rate
+        f_ref       (Hz)           scalar             waveform reference frequency
+
+All four time-series must share the same length N. Each PSD must be on
+the rFFT grid of that time series, i.e. `numpy.fft.rfftfreq(N, 1/fs)`.
 
 Run:
 
@@ -36,25 +41,54 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 from ripple.waveforms.IMRPhenomD import gen_IMRPhenomD_polar
+from scipy.signal.windows import tukey
 
 jax.config.update("jax_enable_x64", True)
 
 DETECTORS = ("H1", "L1")
 
 
-def load_data(path: Path) -> dict:
+def _rfft_to_strain(x_td: np.ndarray, fs: float, alpha: float = 0.1) -> np.ndarray:
+    """Windowed one-sided FFT in strain units (Hz^-1)."""
+    window = tukey(x_td.size, alpha=alpha)
+    return np.fft.rfft(x_td * window) / fs
+
+
+def load_data(path: Path, tukey_alpha: float = 0.1) -> dict:
     with h5py.File(path, "r") as f:
-        freqs = jnp.asarray(f["freqs"][()], dtype=jnp.float64)
+        fs = float(f.attrs["sample_rate"])
+        f_ref = float(f.attrs["f_ref"])
+
+        lengths = {det: f[f"{det}/strain"].shape[0] for det in DETECTORS}
+        if len(set(lengths.values())) != 1:
+            raise ValueError(f"Detector time series lengths differ: {lengths}")
+        n = lengths["H1"]
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
         detectors = {}
         for det in DETECTORS:
+            td = np.asarray(f[f"{det}/strain"][()], dtype=np.float64)
+            psd = np.asarray(f[f"{det}/psd"][()], dtype=np.float64)
+            if psd.shape[0] != freqs.shape[0]:
+                raise ValueError(
+                    f"{det}: PSD length {psd.shape[0]} does not match "
+                    f"rFFT grid length {freqs.shape[0]}"
+                )
             detectors[det] = {
-                "strain": jnp.asarray(f[f"{det}/strain"][()], dtype=jnp.complex128),
-                "psd": jnp.asarray(f[f"{det}/psd"][()], dtype=jnp.float64),
+                "strain": jnp.asarray(_rfft_to_strain(td, fs, tukey_alpha),
+                                      dtype=jnp.complex128),
+                "psd": jnp.asarray(psd, dtype=jnp.float64),
                 "fplus": float(f[f"antenna/{det}/fplus"][()]),
                 "fcross": float(f[f"antenna/{det}/fcross"][()]),
             }
-        f_ref = float(f.attrs["f_ref"])
-    return {"freqs": freqs, "f_ref": f_ref, **detectors}
+
+    return {
+        "freqs": jnp.asarray(freqs, dtype=jnp.float64),
+        "sample_rate": fs,
+        "duration": n / fs,
+        "f_ref": f_ref,
+        **detectors,
+    }
 
 
 def ripple_polarizations(theta, freqs, f_ref):
@@ -148,9 +182,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", required=True, type=Path,
-                   help="HDF5 file with H1/L1 strain, PSD, and antenna factors")
+                   help="HDF5 file with H1/L1 time-series strain, PSD, and antenna factors")
     p.add_argument("--out", default=Path("fit_history.png"), type=Path,
                    help="Output path for the SNR-vs-mass plot")
+    p.add_argument("--tukey-alpha", type=float, default=0.1,
+                   help="Tukey window alpha applied before rFFT")
     p.add_argument("--mc-init", type=float, default=1.4,
                    help="Initial chirp mass guess [Msun]")
     p.add_argument("--eta", type=float, default=0.24,
@@ -168,7 +204,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    data = load_data(args.data)
+    data = load_data(args.data, tukey_alpha=args.tukey_alpha)
 
     init_theta = [
         args.mc_init, args.eta, args.chi1, args.chi2,
