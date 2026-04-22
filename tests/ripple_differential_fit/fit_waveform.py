@@ -166,12 +166,18 @@ def inner_product(a, b, psd, df, mask):
 def network_loglike_and_snr(theta, data):
     freqs = data["freqs"]
     mask = data["mask"]
+    f_min = data["f_min"]
     df = freqs[1] - freqs[0]
-    hp, hc = ripple_polarizations(theta, freqs, data["f_ref"])
-    # Ripple is NaN at f=0 and outside its support; zero those bins so
-    # they can't poison the masked sum.
-    hp = jnp.where(mask, jnp.nan_to_num(hp), 0.0 + 0.0j)
-    hc = jnp.where(mask, jnp.nan_to_num(hc), 0.0 + 0.0j)
+    # Ripple's phase/amplitude have 1/f terms, so evaluating it at f=0 or
+    # outside its support produces NaN/inf values *and* NaN gradients. The
+    # outer mask zeroes those contributions in the forward pass, but
+    # autodiff still runs chain rule through the unsafe bins
+    # (NaN * 0 = NaN). Replace every out-of-band frequency with a safe
+    # in-band value (f_min) so ripple only ever sees finite inputs.
+    safe_freqs = jnp.where(mask, freqs, f_min)
+    hp, hc = ripple_polarizations(theta, safe_freqs, data["f_ref"])
+    hp = jnp.where(mask, hp, 0.0 + 0.0j)
+    hc = jnp.where(mask, hc, 0.0 + 0.0j)
 
     ll = jnp.array(0.0)
     snr_sq = jnp.array(0.0)
@@ -218,6 +224,10 @@ def fit(data, init_theta, n_steps: int, lr: float):
         history["mc"].append(float(mc))
         history["snr"].append(float(snr))
         history["loss"].append(float(loss))
+        if not np.isfinite(grad):
+            print(f"[step {step}] non-finite gradient (mc={float(mc):.4f}, "
+                  f"loss={float(loss)}, snr={float(snr)}); stopping")
+            break
         updates, opt_state = opt.update(grad, opt_state)
         mc = optax.apply_updates(mc, updates)
 
