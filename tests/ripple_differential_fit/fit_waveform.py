@@ -58,12 +58,15 @@ def load_data(path: Path, tukey_alpha: float = 0.1) -> dict:
     with h5py.File(path, "r") as f:
         fs = float(f.attrs["sample_rate"])
         f_ref = float(f.attrs["f_ref"])
+        f_min = float(f.attrs.get("f_min", 20.0))
+        f_max = float(f.attrs.get("f_max", fs / 2.0))
 
         lengths = {det: f[f"{det}/strain"].shape[0] for det in DETECTORS}
         if len(set(lengths.values())) != 1:
             raise ValueError(f"Detector time series lengths differ: {lengths}")
         n = lengths["H1"]
         freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+        mask = (freqs >= f_min) & (freqs <= f_max)
 
         detectors = {}
         for det in DETECTORS:
@@ -74,10 +77,13 @@ def load_data(path: Path, tukey_alpha: float = 0.1) -> dict:
                     f"{det}: PSD length {psd.shape[0]} does not match "
                     f"rFFT grid length {freqs.shape[0]}"
                 )
+            # Replace out-of-band PSD values with a finite sentinel so
+            # division is safe even when the mask drops the contribution.
+            psd_safe = np.where(mask, psd, 1.0)
             detectors[det] = {
                 "strain": jnp.asarray(_rfft_to_strain(td, fs, tukey_alpha),
                                       dtype=jnp.complex128),
-                "psd": jnp.asarray(psd, dtype=jnp.float64),
+                "psd": jnp.asarray(psd_safe, dtype=jnp.float64),
                 "fplus": float(f[f"antenna/{det}/fplus"][()]),
                 "fcross": float(f[f"antenna/{det}/fcross"][()]),
             }
@@ -88,9 +94,12 @@ def load_data(path: Path, tukey_alpha: float = 0.1) -> dict:
 
     return {
         "freqs": jnp.asarray(freqs, dtype=jnp.float64),
+        "mask": jnp.asarray(mask, dtype=bool),
         "sample_rate": fs,
         "duration": n / fs,
         "f_ref": f_ref,
+        "f_min": f_min,
+        "f_max": f_max,
         "truth": truth,
         **detectors,
     }
@@ -149,22 +158,28 @@ def project(hp, hc, fplus: float, fcross: float):
     return fplus * hp + fcross * hc
 
 
-def inner_product(a, b, psd, df):
-    return 4.0 * df * jnp.real(jnp.sum(jnp.conj(a) * b / psd))
+def inner_product(a, b, psd, df, mask):
+    integrand = jnp.where(mask, jnp.conj(a) * b / psd, 0.0 + 0.0j)
+    return 4.0 * df * jnp.real(jnp.sum(integrand))
 
 
 def network_loglike_and_snr(theta, data):
     freqs = data["freqs"]
+    mask = data["mask"]
     df = freqs[1] - freqs[0]
     hp, hc = ripple_polarizations(theta, freqs, data["f_ref"])
+    # Ripple is NaN at f=0 and outside its support; zero those bins so
+    # they can't poison the masked sum.
+    hp = jnp.where(mask, jnp.nan_to_num(hp), 0.0 + 0.0j)
+    hc = jnp.where(mask, jnp.nan_to_num(hc), 0.0 + 0.0j)
 
     ll = jnp.array(0.0)
     snr_sq = jnp.array(0.0)
     for det in DETECTORS:
         d = data[det]
         h = project(hp, hc, d["fplus"], d["fcross"])
-        dh = inner_product(d["strain"], h, d["psd"], df)
-        hh = inner_product(h, h, d["psd"], df)
+        dh = inner_product(d["strain"], h, d["psd"], df, mask)
+        hh = inner_product(h, h, d["psd"], df, mask)
         ll = ll + dh - 0.5 * hh
         snr_sq = snr_sq + dh * dh / hh
     return ll, jnp.sqrt(snr_sq)

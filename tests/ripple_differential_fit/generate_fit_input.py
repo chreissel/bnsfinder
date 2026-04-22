@@ -68,6 +68,7 @@ def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
     ifos = list(config.general.ifos)
     fs = int(config.general.sample_rate)
     f_min = float(config.general.f_min)
+    f_max = float(getattr(config.general, "f_max", fs / 2.0))
     f_ref = float(config.general.f_ref)
     kernel_length = float(config.general.waveform_duration)
 
@@ -135,6 +136,7 @@ def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
         h5.attrs["sample_rate"] = float(fs)
         h5.attrs["f_ref"] = f_ref
         h5.attrs["f_min"] = f_min
+        h5.attrs["f_max"] = f_max
         h5.attrs["duration"] = kernel_length
         for i, det in enumerate(ifos):
             h5.create_dataset(f"{det}/strain", data=strain_np[i])

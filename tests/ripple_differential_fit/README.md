@@ -53,7 +53,13 @@ the antenna-pattern factors for the source sky location and time.
 attrs:
   sample_rate                  scalar    time-series sample rate [Hz]
   f_ref                        scalar    waveform reference frequency [Hz]
+  f_min                        scalar    low-frequency cutoff [Hz] (default 20)
+  f_max                        scalar    high-frequency cutoff [Hz] (default Nyquist)
 ```
+
+The inner product is restricted to the `[f_min, f_max]` band. This keeps
+the `f = 0` bin (where the IMRPhenomD waveform is NaN and the PSD is ~0)
+out of the sum, and matches the band used during data generation.
 
 H1 and L1 time series must share length `N`. The loader applies a Tukey
 window (alpha configurable via `--tukey-alpha`) and takes the one-sided
