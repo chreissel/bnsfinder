@@ -110,7 +110,8 @@ def _inverse_spectrum_truncation(psd: np.ndarray, fs: float,
 def load_data(path: Path, tukey_alpha: float = 0.01,
               waveform: str = "imrphenomd",
               f_taper_width: float = 1.0,
-              psd_max_filter_length: float = 4.0) -> dict:
+              psd_max_filter_length: float = 4.0,
+              template_eval_factor: int = 4) -> dict:
     with h5py.File(path, "r") as f:
         fs = float(f.attrs["sample_rate"])
         f_ref = float(f.attrs["f_ref"])
@@ -129,6 +130,26 @@ def load_data(path: Path, tukey_alpha: float = 0.01,
         weight = taper ** 2
         # Mask used for gradient-safety in ripple evaluation (hard bool).
         mask = band_mask
+
+        # Long evaluation grid for the template, so the in-band inspiral
+        # does not wrap around the segment when iFFT'd (what ml4gw's
+        # TimeDomainCBCWaveformGenerator avoids by picking
+        # df = 1/chirplen). We evaluate ripple on this fine grid, iFFT
+        # to time, keep only the last ``n`` samples (same truncation
+        # ml4gw applies to its output), then FFT back onto the segment
+        # grid. ``template_eval_factor`` sets eval_N / n; 4x comfortably
+        # covers BNS in 64 s at f_min = 20 Hz.
+        eval_factor = max(1, int(template_eval_factor))
+        eval_N = eval_factor * n
+        eval_freqs = np.fft.rfftfreq(eval_N, d=1.0 / fs)
+        eval_mask = (eval_freqs >= f_min) & (eval_freqs <= f_max)
+        # Extra time that the eval window gives us; template tc values
+        # stored on the segment frame are shifted by this amount so the
+        # coalescence lands at the right place after truncation.
+        tc_offset = (eval_N - n) / fs
+        # Tukey window applied to the truncated template, matching the
+        # data-side window exactly.
+        tukey_win_td = tukey(n, alpha=tukey_alpha).astype(np.float64)
 
         detectors = {}
         for det in DETECTORS:
@@ -162,6 +183,12 @@ def load_data(path: Path, tukey_alpha: float = 0.01,
         "freqs": jnp.asarray(freqs, dtype=jnp.float64),
         "mask": jnp.asarray(mask, dtype=bool),
         "weight": jnp.asarray(weight, dtype=jnp.float64),
+        "eval_freqs": jnp.asarray(eval_freqs, dtype=jnp.float64),
+        "eval_mask": jnp.asarray(eval_mask, dtype=bool),
+        "eval_N": int(eval_N),
+        "segment_N": int(n),
+        "tc_offset": float(tc_offset),
+        "tukey_td": jnp.asarray(tukey_win_td, dtype=jnp.float64),
         "sample_rate": fs,
         "duration": n / fs,
         "f_ref": f_ref,
@@ -271,16 +298,43 @@ def network_stats(theta, data):
     weight = data["weight"]
     f_min = data["f_min"]
     df = freqs[1] - freqs[0]
-    # Ripple's phase/amplitude have 1/f terms, so evaluating it at f=0 or
-    # outside its support produces NaN/inf values *and* NaN gradients. The
-    # outer mask zeroes those contributions in the forward pass, but
-    # autodiff still runs chain rule through the unsafe bins
-    # (NaN * 0 = NaN). Replace every out-of-band frequency with a safe
-    # in-band value (f_min) so ripple only ever sees finite inputs.
-    safe_freqs = jnp.where(mask, freqs, f_min)
-    hp, hc = ripple_polarizations(
-        theta, safe_freqs, data["f_ref"], data["waveform"],
+    fs = data["sample_rate"]
+
+    # ---- Template on a long ``eval_N`` grid to avoid circular aliasing ----
+    # ml4gw's TimeDomainCBCWaveformGenerator picks df small enough that the
+    # full in-band chirp fits without wrap-around, iFFTs, then truncates to
+    # the requested segment length. We do the same here so ⟨h|h⟩ and the
+    # matched filter match what produced the truth SNR in the HDF5.
+    eval_freqs = data["eval_freqs"]
+    eval_mask = data["eval_mask"]
+    eval_N = data["eval_N"]
+    seg_N = data["segment_N"]
+    tc_offset = data["tc_offset"]
+
+    # Shift the user-facing tc (defined on the segment) into the eval
+    # window so the coalescence lands at the same offset from the right
+    # edge after truncation.
+    theta_eval = theta.at[5].set(theta[5] + tc_offset)
+
+    # Gradient-safety: replace out-of-band eval frequencies with f_min
+    # before calling ripple (1/f terms otherwise NaN the gradient).
+    safe_eval_freqs = jnp.where(eval_mask, eval_freqs, f_min)
+    hp_long, hc_long = ripple_polarizations(
+        theta_eval, safe_eval_freqs, data["f_ref"], data["waveform"],
     )
+    hp_long = jnp.where(eval_mask, hp_long, 0.0 + 0.0j)
+    hc_long = jnp.where(eval_mask, hc_long, 0.0 + 0.0j)
+
+    # Long -> time domain -> truncate last seg_N samples (right-aligned,
+    # where the merger sits) -> window with the same Tukey used on data
+    # -> back to the segment rFFT grid.
+    hp_td = jnp.fft.irfft(hp_long, n=eval_N) * fs
+    hc_td = jnp.fft.irfft(hc_long, n=eval_N) * fs
+    hp_td = hp_td[eval_N - seg_N:] * data["tukey_td"]
+    hc_td = hc_td[eval_N - seg_N:] * data["tukey_td"]
+    hp = jnp.fft.rfft(hp_td) / fs
+    hc = jnp.fft.rfft(hc_td) / fs
+
     hp = jnp.where(mask, hp, 0.0 + 0.0j)
     hc = jnp.where(mask, hc, 0.0 + 0.0j)
 
@@ -444,6 +498,15 @@ def parse_args() -> argparse.Namespace:
                         "truncation). Prevents the whitening filter's impulse "
                         "response from wrapping around the segment and biasing "
                         "the SNR. Set 0 to disable.")
+    p.add_argument("--template-eval-factor", type=int, default=4,
+                   help="Multiplier on the segment length used as the "
+                        "template's internal frequency-domain evaluation grid. "
+                        "The template is evaluated at df = 1/(factor*T), "
+                        "iFFT'd, truncated to T, and FFT'd back. Matches what "
+                        "ml4gw's TimeDomainCBCWaveformGenerator does so the "
+                        "in-band inspiral does not wrap around the segment. "
+                        "Increase if your BNS chirp is longer than "
+                        "factor * T - T (e.g. very low Mc at f_min = 20 Hz).")
     p.add_argument("--mc-init", type=float, default=1.4,
                    help="Initial chirp mass guess [Msun]")
     p.add_argument("--eta", type=float, default=0.24,
@@ -488,6 +551,7 @@ def main() -> None:
         waveform=args.waveform,
         f_taper_width=args.f_taper_width,
         psd_max_filter_length=args.psd_max_filter_length,
+        template_eval_factor=args.template_eval_factor,
     )
     print(f"Waveform template:    {args.waveform}")
     print(f"Tukey alpha:          {args.tukey_alpha}")
@@ -495,6 +559,8 @@ def main() -> None:
     print(f"PSD truncation:       "
           f"{args.psd_max_filter_length:.2f} s"
           f"{'  (disabled)' if args.psd_max_filter_length <= 0 else ''}")
+    print(f"Template eval grid:   {args.template_eval_factor}x segment "
+          f"({args.template_eval_factor * data['duration']:.1f} s)")
 
     truth = data["truth"]
     if truth is not None:

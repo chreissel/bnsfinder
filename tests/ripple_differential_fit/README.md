@@ -126,11 +126,16 @@ before the inner product. Defaults mirror what PyCBC/GstLAL use:
   circular FFT and biasing the SNR. Standard trick from
   `pycbc.psd.inverse_spectrum_truncation`. Set 0 to disable.
 
-These only address what the fit can do. What they cannot fix is a
-segment that is shorter than the in-band template (e.g. a ~100 s BNS
-chirp in a 64 s kernel) — real pipelines avoid that configuration by
-using 256+ s segments. If your fit is still biased after enabling the
-above, the next thing to tune is the generator's `waveform_duration`.
+On top of that, the template itself is evaluated on an internally-
+longer grid (`--template-eval-factor`, default 4×) and then
+iFFT'd → truncated to the segment → windowed → FFT'd back, the same
+way `ml4gw.waveforms.generator.TimeDomainCBCWaveformGenerator` avoids
+circular aliasing. Without this step a ~100 s BNS chirp sampled on the
+segment's `df = 1/T` grid has its early inspiral wrapping around the
+segment; `⟨h|h⟩` then counts the wrapped energy while `⟨d|h⟩` does not,
+which drops the recovered SNR by ~3× even at the correct chirp mass.
+Bump the factor if the in-band chirp duration exceeds
+`(factor - 1) × T`.
 
 ### Waveform template
 
