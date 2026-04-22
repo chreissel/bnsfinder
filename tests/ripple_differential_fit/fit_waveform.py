@@ -234,7 +234,7 @@ def fit(data, init_theta, n_steps: int, lr: float):
     return float(mc), history
 
 
-def plot_history(history, out_path: Path) -> None:
+def plot_history(history, out_path: Path, truth: dict | None = None) -> None:
     mcs = np.asarray(history["mc"])
     snrs = np.asarray(history["snr"])
     iters = np.arange(len(mcs))
@@ -242,6 +242,15 @@ def plot_history(history, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.plot(mcs, snrs, "-", color="gray", alpha=0.4, zorder=1)
     sc = ax.scatter(mcs, snrs, c=iters, cmap="viridis", s=18, zorder=2)
+    if truth is not None:
+        if "chirp_mass" in truth:
+            ax.axvline(_float(truth["chirp_mass"]), ls="--", color="crimson",
+                       lw=1, alpha=0.7, label="truth $\\mathcal{M}$")
+        if "snr" in truth:
+            ax.axhline(_float(truth["snr"]), ls="--", color="navy",
+                       lw=1, alpha=0.7, label="truth network SNR")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="best", fontsize=9)
     ax.set_xlabel(r"Chirp mass $\mathcal{M}$ [$M_\odot$]")
     ax.set_ylabel("Network SNR")
     ax.set_title("Differential fit trajectory")
@@ -283,8 +292,15 @@ def main() -> None:
     args = parse_args()
     data = load_data(args.data, tukey_alpha=args.tukey_alpha)
 
+    truth = data["truth"]
+    if truth is not None:
+        if "chirp_mass" in truth:
+            print(f"Truth chirp mass:     {_float(truth['chirp_mass']):.4f} Msun")
+        if "snr" in truth:
+            print(f"Truth network SNR:    {_float(truth['snr']):.3f}")
+
     if args.init_from_truth:
-        init_from_truth(args, data["truth"])
+        init_from_truth(args, truth)
 
     init_theta = [
         args.mc_init, args.eta, args.chi1, args.chi2,
@@ -294,7 +310,7 @@ def main() -> None:
 
     print(f"Recovered chirp mass: {mc_fit:.4f} Msun")
     print(f"Final network SNR:    {history['snr'][-1]:.3f}")
-    plot_history(history, args.out)
+    plot_history(history, args.out, truth=truth)
     print(f"Wrote {args.out}")
 
 
