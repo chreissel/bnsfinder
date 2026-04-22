@@ -44,11 +44,14 @@ sys.path.insert(0, str(GW_DIR))
 from utils import load_config  # noqa: E402  (from submodule)
 from waveforms import generate_signals  # noqa: E402  (from submodule)
 
+import importlib  # noqa: E402
+
 from ml4gw.dataloading import Hdf5TimeSeriesDataset  # noqa: E402
 from ml4gw.gw import (  # noqa: E402
     compute_antenna_responses,
     compute_network_snr,
     get_ifo_geometry,
+    reweight_snrs,
 )
 from ml4gw.transforms import SpectralDensity  # noqa: E402
 
@@ -62,7 +65,12 @@ def _interp_psd(psd: np.ndarray, fs: float, n_target: int) -> np.ndarray:
     return np.stack([np.interp(f_target, f_orig, row) for row in psd])
 
 
-def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
+def generate(
+    config_path: Path,
+    data_dir: Path,
+    out_path: Path,
+    reweight: bool = True,
+) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = load_config(str(config_path))
 
@@ -110,6 +118,35 @@ def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
     waveforms, params = generate_signals(config, device=device, save=False)
     # waveforms: [1, n_ifos, num_samples] projected (observed) strain.
 
+    # --- PSD onto rFFT grid of the kernel (shared downstream) ---
+    n_freqs = kernel_size // 2 + 1
+    psd_tensor = psd
+    if psd_tensor.shape[-1] != n_freqs:
+        while psd_tensor.ndim < 3:
+            psd_tensor = psd_tensor[None]
+        psd_tensor = torch.nn.functional.interpolate(
+            psd_tensor, size=(n_freqs,), mode="linear"
+        )
+
+    # --- SNR reweighting (same convention as injections.py) ---
+    # Upstream rescales each waveform's amplitude so its network SNR
+    # matches a draw from the snr_reweighting distribution in the config.
+    # Without this the SNR is whatever the sampled distance yields, which
+    # for typical distance priors (e.g. PowerLaw[100,1000,2]) is low.
+    if reweight and hasattr(config, "snr_reweighting"):
+        func_path = config.snr_reweighting.func
+        module_name, func_name = func_path.rsplit(".", 1)
+        func = getattr(importlib.import_module(module_name), func_name)
+        target_snrs = (
+            func(*config.snr_reweighting.args)
+            .sample((config.general.batch_size,))
+            .to(device)
+        )
+        waveforms = reweight_snrs(
+            responses=waveforms, target_snrs=target_snrs,
+            psd=psd_tensor, sample_rate=fs, highpass=f_min,
+        )
+
     # Match injections.py padding: drop fduration/2 from each edge of kernel.
     pad = int(fduration / 2 * fs)
     injected = kernel.detach().clone()
@@ -126,18 +163,9 @@ def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
     fplus = antenna[0, 0, :].detach().cpu().numpy()
     fcross = antenna[0, 1, :].detach().cpu().numpy()
 
-    # --- PSD onto rFFT grid of the kernel ---
-    n_freqs = kernel_size // 2 + 1
-    psd_tensor = psd
-    if psd_tensor.shape[-1] != n_freqs:
-        while psd_tensor.ndim < 3:
-            psd_tensor = psd_tensor[None]
-        psd_tensor = torch.nn.functional.interpolate(
-            psd_tensor, size=(n_freqs,), mode="linear"
-        )
     psd_np = psd_tensor[0].detach().cpu().numpy()
 
-    # --- Truth network SNR (matches injection() convention) ---
+    # --- Truth network SNR on the (possibly reweighted) waveforms ---
     network_snr = compute_network_snr(
         responses=waveforms, psd=psd_tensor,
         sample_rate=fs, highpass=f_min,
@@ -190,12 +218,17 @@ def parse_args() -> argparse.Namespace:
                    help="Directory with background HDF5 files")
     p.add_argument("--out", default=Path("data.h5"), type=Path,
                    help="Output fit-ready HDF5 file")
+    p.add_argument("--no-reweight", action="store_true",
+                   help="Skip the SNR reweighting step (config.snr_reweighting). "
+                        "By default the waveform amplitude is rescaled so the "
+                        "network SNR matches a draw from that distribution, "
+                        "mirroring GWDatasetGeneration/injections.py.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    generate(args.config, args.data, args.out)
+    generate(args.config, args.data, args.out, reweight=not args.no_reweight)
 
 
 if __name__ == "__main__":

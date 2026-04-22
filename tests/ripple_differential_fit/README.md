@@ -37,6 +37,18 @@ Download background data once with the submodule's `load_data.py`. Truth
 parameters sampled during generation are preserved under `/truth` in the
 output HDF5 for comparison against the fit.
 
+The generator mirrors upstream `injections.py` in two places:
+
+- **SNR reweighting is applied by default.** Each waveform's amplitude is
+  rescaled so the network SNR matches a draw from the
+  `config.snr_reweighting` distribution (e.g. `PowerLaw[12,100,-3]` in
+  the BBH config). Pass `--no-reweight` to use the raw SNR implied by
+  the sampled distance instead.
+- **Whitening is intentionally skipped.** The matched-filter inner
+  product `4 Δf Re Σ d*·h / S_n` already "whitens" both sides via the
+  `1/S_n` factor, so the fit needs raw coloured strain + PSD rather than
+  a pre-whitened time series.
+
 ## Input data
 
 `fit_waveform.py` reads a single HDF5 file (e.g. produced by
