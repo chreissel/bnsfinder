@@ -78,6 +78,20 @@ chirp mass is fit. To fit additional parameters, expand
 `make_fit_fns` in `fit_waveform.py` to return gradients w.r.t. the full
 parameter vector.
 
+### Optimisation target
+
+Two losses are available via `--loss`:
+
+- `--loss snr` (default) — minimise `-ρ²_net` where `ρ²_net = Σ_det |⟨d|h⟩|² / ⟨h|h⟩`
+  is the phase-maximised network SNR squared. This is the standard
+  CBC-search statistic: it is invariant under distance and insensitive
+  to the coalescence phase, so the template-vs-data match depends only
+  on the intrinsic shape.
+- `--loss logl` — minimise `-(⟨d|h⟩ - ½⟨h|h⟩)`, the Gaussian
+  matched-filter log-likelihood. This uses the real inner product and
+  is sensitive to distance and phase, so it only performs well when
+  those are initialised near truth.
+
 ### Initialising non-mass parameters from truth
 
 For sanity checks you can seed every non-mass parameter from the `/truth`

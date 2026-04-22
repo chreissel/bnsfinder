@@ -159,11 +159,22 @@ def project(hp, hc, fplus: float, fcross: float):
 
 
 def inner_product(a, b, psd, df, mask):
+    """Real matched-filter inner product 4 df Re Σ conj(a) b / S_n."""
     integrand = jnp.where(mask, jnp.conj(a) * b / psd, 0.0 + 0.0j)
     return 4.0 * df * jnp.real(jnp.sum(integrand))
 
 
-def network_loglike_and_snr(theta, data):
+def complex_inner_product(a, b, psd, df, mask):
+    """Complex matched-filter inner product 4 df Σ conj(a) b / S_n.
+
+    Taking |·| of this phase-maximises over the coalescence phase.
+    """
+    integrand = jnp.where(mask, jnp.conj(a) * b / psd, 0.0 + 0.0j)
+    return 4.0 * df * jnp.sum(integrand)
+
+
+def network_stats(theta, data):
+    """Compute (log_likelihood, rho_sq_net, rho_net) for one parameter set."""
     freqs = data["freqs"]
     mask = data["mask"]
     f_min = data["f_min"]
@@ -180,39 +191,53 @@ def network_loglike_and_snr(theta, data):
     hc = jnp.where(mask, hc, 0.0 + 0.0j)
 
     ll = jnp.array(0.0)
-    snr_sq = jnp.array(0.0)
+    rho_sq = jnp.array(0.0)
     for det in DETECTORS:
         d = data[det]
         h = project(hp, hc, d["fplus"], d["fcross"])
-        dh = inner_product(d["strain"], h, d["psd"], df, mask)
+        dh_real = inner_product(d["strain"], h, d["psd"], df, mask)
+        dh_complex = complex_inner_product(d["strain"], h, d["psd"], df, mask)
         hh = inner_product(h, h, d["psd"], df, mask)
-        ll = ll + dh - 0.5 * hh
-        snr_sq = snr_sq + dh * dh / hh
-    return ll, jnp.sqrt(snr_sq)
+        ll = ll + dh_real - 0.5 * hh
+        # Phase-maximised per-detector ρ² = |⟨d|h⟩|² / ⟨h|h⟩
+        rho_sq = rho_sq + (dh_complex * jnp.conj(dh_complex)).real / hh
+    return ll, rho_sq, jnp.sqrt(rho_sq)
 
 
-def make_fit_fns(data, fixed_rest):
-    """Return jitted loss, grad and SNR functions that take only chirp mass."""
+def make_fit_fns(data, fixed_rest, loss_kind: str = "snr"):
+    """Return jitted loss, grad and SNR functions that take only chirp mass.
+
+    loss_kind:
+        "snr"  — minimise -ρ²_net (maximise phase-maximised network SNR²).
+        "logl" — minimise -log L (Gaussian matched-filter log-likelihood).
+    """
     fixed_rest = jnp.asarray(fixed_rest, dtype=jnp.float64)
 
     def theta_of(mc):
         return jnp.concatenate([jnp.array([mc]), fixed_rest])
 
-    def loss(mc):
-        ll, _ = network_loglike_and_snr(theta_of(mc), data)
-        return -ll
+    if loss_kind == "snr":
+        def loss(mc):
+            _, rho_sq, _ = network_stats(theta_of(mc), data)
+            return -rho_sq
+    elif loss_kind == "logl":
+        def loss(mc):
+            ll, _, _ = network_stats(theta_of(mc), data)
+            return -ll
+    else:
+        raise ValueError(f"Unknown loss_kind: {loss_kind!r}")
 
     def snr(mc):
-        _, s = network_loglike_and_snr(theta_of(mc), data)
+        _, _, s = network_stats(theta_of(mc), data)
         return s
 
     return jax.jit(jax.value_and_grad(loss)), jax.jit(snr)
 
 
-def fit(data, init_theta, n_steps: int, lr: float):
+def fit(data, init_theta, n_steps: int, lr: float, loss_kind: str = "snr"):
     init_theta = np.asarray(init_theta, dtype=np.float64)
     mc = jnp.asarray(init_theta[0])
-    loss_grad_fn, snr_fn = make_fit_fns(data, init_theta[1:])
+    loss_grad_fn, snr_fn = make_fit_fns(data, init_theta[1:], loss_kind)
 
     opt = optax.adam(lr)
     opt_state = opt.init(mc)
@@ -285,6 +310,11 @@ def parse_args() -> argparse.Namespace:
                    help="Initialise all non-mass parameters from the /truth "
                         "group in the HDF5 (simulation-only info; use only "
                         "for sanity checks). Chirp mass still starts at --mc-init.")
+    p.add_argument("--loss", choices=("snr", "logl"), default="snr",
+                   help="Optimisation target. 'snr' maximises the "
+                        "phase-maximised network SNR squared (standard CBC "
+                        "search statistic, distance-independent); 'logl' "
+                        "maximises the Gaussian matched-filter log-likelihood.")
     return p.parse_args()
 
 
@@ -306,7 +336,8 @@ def main() -> None:
         args.mc_init, args.eta, args.chi1, args.chi2,
         args.dist, args.tc, args.phic, args.inclination,
     ]
-    mc_fit, history = fit(data, init_theta, n_steps=args.steps, lr=args.lr)
+    mc_fit, history = fit(data, init_theta, n_steps=args.steps, lr=args.lr,
+                          loss_kind=args.loss)
 
     print(f"Recovered chirp mass: {mc_fit:.4f} Msun")
     print(f"Final network SNR:    {history['snr'][-1]:.3f}")
