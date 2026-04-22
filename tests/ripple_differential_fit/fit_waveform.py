@@ -234,21 +234,44 @@ def make_fit_fns(data, fixed_rest, loss_kind: str = "snr"):
     return jax.jit(jax.value_and_grad(loss)), jax.jit(snr)
 
 
-def fit(data, init_theta, n_steps: int, lr: float, loss_kind: str = "snr"):
+def _build_schedule(lr: float, lr_final: float, n_steps: int, kind: str):
+    """Step-size schedule for Adam. Bigger for exploration, smaller for refine."""
+    if kind == "const" or lr_final is None or lr_final == lr:
+        return optax.constant_schedule(lr)
+    if kind == "cosine":
+        return optax.cosine_decay_schedule(
+            init_value=lr,
+            decay_steps=max(n_steps - 1, 1),
+            alpha=lr_final / lr,
+        )
+    if kind == "exponential":
+        if lr <= 0 or lr_final <= 0:
+            raise ValueError("exponential schedule requires positive lr / lr_final")
+        rate = (lr_final / lr) ** (1.0 / max(n_steps - 1, 1))
+        return optax.exponential_decay(
+            init_value=lr, transition_steps=1, decay_rate=rate,
+        )
+    raise ValueError(f"Unknown lr schedule: {kind!r}")
+
+
+def fit(data, init_theta, n_steps: int, lr: float, loss_kind: str = "snr",
+        lr_final: float | None = None, lr_schedule: str = "cosine"):
     init_theta = np.asarray(init_theta, dtype=np.float64)
     mc = jnp.asarray(init_theta[0])
     loss_grad_fn, snr_fn = make_fit_fns(data, init_theta[1:], loss_kind)
 
-    opt = optax.adam(lr)
+    schedule = _build_schedule(lr, lr_final, n_steps, lr_schedule)
+    opt = optax.adam(schedule)
     opt_state = opt.init(mc)
 
-    history = {"mc": [], "snr": [], "loss": []}
+    history = {"mc": [], "snr": [], "loss": [], "lr": []}
     for step in range(n_steps):
         loss, grad = loss_grad_fn(mc)
         snr = snr_fn(mc)
         history["mc"].append(float(mc))
         history["snr"].append(float(snr))
         history["loss"].append(float(loss))
+        history["lr"].append(float(schedule(step)))
         if not np.isfinite(grad):
             print(f"[step {step}] non-finite gradient (mc={float(mc):.4f}, "
                   f"loss={float(loss)}, snr={float(snr)}); stopping")
@@ -262,9 +285,18 @@ def fit(data, init_theta, n_steps: int, lr: float, loss_kind: str = "snr"):
 def plot_history(history, out_path: Path, truth: dict | None = None) -> None:
     mcs = np.asarray(history["mc"])
     snrs = np.asarray(history["snr"])
+    lrs = np.asarray(history.get("lr", []))
     iters = np.arange(len(mcs))
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    has_lr = lrs.size == iters.size and lrs.size > 0
+    if has_lr:
+        fig, (ax, ax_lr) = plt.subplots(
+            1, 2, figsize=(11, 5),
+            gridspec_kw={"width_ratios": [2.5, 1]},
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(7, 5))
+
     ax.plot(mcs, snrs, "-", color="gray", alpha=0.4, zorder=1)
     sc = ax.scatter(mcs, snrs, c=iters, cmap="viridis", s=18, zorder=2)
     if truth is not None:
@@ -281,6 +313,15 @@ def plot_history(history, out_path: Path, truth: dict | None = None) -> None:
     ax.set_title("Differential fit trajectory")
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Iteration")
+
+    if has_lr:
+        ax_lr.plot(iters, lrs, color="C2")
+        ax_lr.set_yscale("log")
+        ax_lr.set_xlabel("Iteration")
+        ax_lr.set_ylabel("Learning rate")
+        ax_lr.set_title("Step-size schedule")
+        ax_lr.grid(True, which="both", ls=":", alpha=0.4)
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
 
@@ -305,7 +346,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--phic", type=float, default=0.0)
     p.add_argument("--inclination", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=200)
-    p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--lr", type=float, default=0.1,
+                   help="Initial Adam learning rate (explore phase).")
+    p.add_argument("--lr-final", type=float, default=1e-3,
+                   help="Final Adam learning rate at the last step "
+                        "(refine phase). Ignored if --lr-schedule const.")
+    p.add_argument("--lr-schedule", choices=("cosine", "exponential", "const"),
+                   default="cosine",
+                   help="Learning-rate schedule from --lr down to --lr-final.")
     p.add_argument("--init-from-truth", action="store_true",
                    help="Initialise all non-mass parameters from the /truth "
                         "group in the HDF5 (simulation-only info; use only "
@@ -337,7 +385,9 @@ def main() -> None:
         args.dist, args.tc, args.phic, args.inclination,
     ]
     mc_fit, history = fit(data, init_theta, n_steps=args.steps, lr=args.lr,
-                          loss_kind=args.loss)
+                          loss_kind=args.loss,
+                          lr_final=args.lr_final,
+                          lr_schedule=args.lr_schedule)
 
     print(f"Recovered chirp mass: {mc_fit:.4f} Msun")
     print(f"Final network SNR:    {history['snr'][-1]:.3f}")

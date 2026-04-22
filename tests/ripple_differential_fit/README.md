@@ -90,6 +90,22 @@ chirp mass is fit. To fit additional parameters, expand
 `make_fit_fns` in `fit_waveform.py` to return gradients w.r.t. the full
 parameter vector.
 
+### Learning-rate schedule (explore then refine)
+
+Adam's step size follows a schedule selected by `--lr-schedule`:
+
+- `cosine` (default) — smooth decay from `--lr` down to `--lr-final` over
+  `--steps` iterations. Early steps are large enough to traverse flat
+  regions of the loss; late steps shrink so the fit can settle into the
+  peak without overshooting.
+- `exponential` — multiplicative decay from `--lr` to `--lr-final`.
+- `const` — no decay; use the old fixed-rate behaviour (ignores
+  `--lr-final`).
+
+Defaults are `--lr 0.1 --lr-final 1e-3`; pick a larger `--lr` if the
+trajectory gets stuck in a local feature. The effective LR at each step
+is recorded in `history["lr"]` and drawn alongside the SNR-vs-mass plot.
+
 ### Optimisation target
 
 Two losses are available via `--loss`:
