@@ -106,6 +106,23 @@ Defaults are `--lr 0.1 --lr-final 1e-3`; pick a larger `--lr` if the
 trajectory gets stuck in a local feature. The effective LR at each step
 is recorded in `history["lr"]` and drawn alongside the SNR-vs-mass plot.
 
+### Waveform template
+
+`--waveform` selects which ripple model is used as the template:
+
+- `imrphenomd` (default) — `gen_IMRPhenomD_hphc`. Matches
+  `GWDatasetGeneration`'s BBH path (`ml4gw.waveforms.IMRPhenomD`).
+- `taylorf2` — `gen_TaylorF2_hphc` with `use_lambda_tildes=False` and
+  `lambda1 = lambda2 = 0`. Matches `GWDatasetGeneration`'s BNS path
+  (`ml4gw.waveforms.TaylorF2`, point-particle, 3.5 PN phase). Using
+  IMRPhenomD against a TaylorF2 BNS injection produces a large phase
+  mismatch that keeps the optimiser stuck — switch to `taylorf2` for
+  BNS data.
+
+The fit parameter vector is the same `[Mc, eta, chi1, chi2, D, tc,
+phic, inclination]` for both choices; the TaylorF2 path internally
+inserts `lambda1 = lambda2 = 0` before calling ripple.
+
 ### Optimisation target
 
 Two losses are available via `--loss`:
