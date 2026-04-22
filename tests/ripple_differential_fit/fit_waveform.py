@@ -49,14 +49,68 @@ jax.config.update("jax_enable_x64", True)
 DETECTORS = ("H1", "L1")
 
 
-def _rfft_to_strain(x_td: np.ndarray, fs: float, alpha: float = 0.1) -> np.ndarray:
-    """Windowed one-sided FFT in strain units (Hz^-1)."""
+def _rfft_to_strain(x_td: np.ndarray, fs: float, alpha: float = 0.01) -> np.ndarray:
+    """Windowed one-sided FFT in strain units (Hz^-1).
+
+    Pipeline-standard practice is a very mild Tukey (alpha ~ 0.01): just
+    enough to kill the FFT wrap-around discontinuity without biting
+    into the in-band signal.
+    """
     window = tukey(x_td.size, alpha=alpha)
     return np.fft.rfft(x_td * window) / fs
 
 
-def load_data(path: Path, tukey_alpha: float = 0.1,
-              waveform: str = "imrphenomd") -> dict:
+def _soft_onset_taper(freqs: np.ndarray, f_min: float, f_max: float,
+                      f_width: float) -> np.ndarray:
+    """Raised-cosine ramp from 0 at f_min to 1 at f_min + f_width; hard 0
+    above f_max. Applied symmetrically to both data and template, this is
+    the frequency-domain equivalent of the time-domain onset taper that
+    pipelines (``pycbc.waveform.taper_timeseries``) use to suppress Gibbs
+    ringing from the hard f_min cutoff. Returns ``T(f)`` (not T^2).
+    """
+    if f_width <= 0.0:
+        return ((freqs >= f_min) & (freqs <= f_max)).astype(np.float64)
+    x = np.clip((freqs - f_min) / f_width, 0.0, 1.0)
+    ramp = 0.5 * (1.0 - np.cos(np.pi * x))
+    return ramp * (freqs <= f_max).astype(np.float64)
+
+
+def _inverse_spectrum_truncation(psd: np.ndarray, fs: float,
+                                 max_filter_len: float,
+                                 band_mask: np.ndarray) -> np.ndarray:
+    """Truncate the 1/sqrt(S_n) whitening kernel to finite time duration.
+
+    Without this, the whitening filter's impulse response has a long tail
+    that wraps around the segment via the FFT's implicit periodicity and
+    biases the matched filter. Standard procedure (``pycbc.psd.
+    inverse_spectrum_truncation``): iFFT the inverse ASD, keep a central
+    window of length ``max_filter_len`` seconds, FFT back, square to get
+    a truncated PSD. ``band_mask`` zeroes the inverse ASD outside
+    [f_min, f_max] before the iFFT.
+    """
+    if max_filter_len <= 0.0:
+        return psd
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_asd = np.where(band_mask, 1.0 / np.sqrt(psd), 0.0)
+    kernel = np.fft.irfft(inv_asd)
+    n = kernel.size
+    half_len = int(round(max_filter_len * fs / 2.0))
+    half_len = min(half_len, n // 2 - 1)
+    # Roll so the kernel's peak at lag 0 sits at index n//2, window, unroll.
+    centered = np.roll(kernel, n // 2)
+    w = np.zeros(n)
+    lo, hi = n // 2 - half_len, n // 2 + half_len
+    w[lo:hi] = tukey(hi - lo, alpha=0.25)
+    centered *= w
+    truncated = np.roll(centered, -(n // 2))
+    inv_asd_new = np.fft.rfft(truncated)
+    return 1.0 / np.maximum(np.abs(inv_asd_new) ** 2, 1e-300)
+
+
+def load_data(path: Path, tukey_alpha: float = 0.01,
+              waveform: str = "imrphenomd",
+              f_taper_width: float = 1.0,
+              psd_max_filter_length: float = 4.0) -> dict:
     with h5py.File(path, "r") as f:
         fs = float(f.attrs["sample_rate"])
         f_ref = float(f.attrs["f_ref"])
@@ -68,7 +122,13 @@ def load_data(path: Path, tukey_alpha: float = 0.1,
             raise ValueError(f"Detector time series lengths differ: {lengths}")
         n = lengths["H1"]
         freqs = np.fft.rfftfreq(n, d=1.0 / fs)
-        mask = (freqs >= f_min) & (freqs <= f_max)
+        band_mask = (freqs >= f_min) & (freqs <= f_max)
+        # Soft onset taper, applied symmetrically to both data and template
+        # via the inner-product integrand weight T(f)^2.
+        taper = _soft_onset_taper(freqs, f_min, f_max, f_taper_width)
+        weight = taper ** 2
+        # Mask used for gradient-safety in ripple evaluation (hard bool).
+        mask = band_mask
 
         detectors = {}
         for det in DETECTORS:
@@ -79,9 +139,13 @@ def load_data(path: Path, tukey_alpha: float = 0.1,
                     f"{det}: PSD length {psd.shape[0]} does not match "
                     f"rFFT grid length {freqs.shape[0]}"
                 )
+            # Pipeline-standard inverse spectrum truncation.
+            psd_tr = _inverse_spectrum_truncation(
+                psd, fs, psd_max_filter_length, band_mask,
+            )
             # Replace out-of-band PSD values with a finite sentinel so
-            # division is safe even when the mask drops the contribution.
-            psd_safe = np.where(mask, psd, 1.0)
+            # division is safe even when the weight drops the contribution.
+            psd_safe = np.where(band_mask, psd_tr, 1.0)
             detectors[det] = {
                 "strain": jnp.asarray(_rfft_to_strain(td, fs, tukey_alpha),
                                       dtype=jnp.complex128),
@@ -97,6 +161,7 @@ def load_data(path: Path, tukey_alpha: float = 0.1,
     return {
         "freqs": jnp.asarray(freqs, dtype=jnp.float64),
         "mask": jnp.asarray(mask, dtype=bool),
+        "weight": jnp.asarray(weight, dtype=jnp.float64),
         "sample_rate": fs,
         "duration": n / fs,
         "f_ref": f_ref,
@@ -179,18 +244,23 @@ def project(hp, hc, fplus: float, fcross: float):
     return fplus * hp + fcross * hc
 
 
-def inner_product(a, b, psd, df, mask):
-    """Real matched-filter inner product 4 df Re Σ conj(a) b / S_n."""
-    integrand = jnp.where(mask, jnp.conj(a) * b / psd, 0.0 + 0.0j)
+def inner_product(a, b, psd, df, weight):
+    """Real matched-filter inner product 4 df Re Σ T^2 · conj(a) b / S_n.
+
+    ``weight = T(f)^2`` applies the symmetric soft onset taper; treating
+    it as an integrand factor is equivalent to ``⟨T·a | T·b⟩`` so data
+    and template are filtered identically.
+    """
+    integrand = weight * jnp.conj(a) * b / psd
     return 4.0 * df * jnp.real(jnp.sum(integrand))
 
 
-def complex_inner_product(a, b, psd, df, mask):
-    """Complex matched-filter inner product 4 df Σ conj(a) b / S_n.
+def complex_inner_product(a, b, psd, df, weight):
+    """Complex matched-filter inner product 4 df Σ T^2 · conj(a) b / S_n.
 
     Taking |·| of this phase-maximises over the coalescence phase.
     """
-    integrand = jnp.where(mask, jnp.conj(a) * b / psd, 0.0 + 0.0j)
+    integrand = weight * jnp.conj(a) * b / psd
     return 4.0 * df * jnp.sum(integrand)
 
 
@@ -198,6 +268,7 @@ def network_stats(theta, data):
     """Compute (log_likelihood, rho_sq_net, rho_net) for one parameter set."""
     freqs = data["freqs"]
     mask = data["mask"]
+    weight = data["weight"]
     f_min = data["f_min"]
     df = freqs[1] - freqs[0]
     # Ripple's phase/amplitude have 1/f terms, so evaluating it at f=0 or
@@ -218,9 +289,9 @@ def network_stats(theta, data):
     for det in DETECTORS:
         d = data[det]
         h = project(hp, hc, d["fplus"], d["fcross"])
-        dh_real = inner_product(d["strain"], h, d["psd"], df, mask)
-        dh_complex = complex_inner_product(d["strain"], h, d["psd"], df, mask)
-        hh = inner_product(h, h, d["psd"], df, mask)
+        dh_real = inner_product(d["strain"], h, d["psd"], df, weight)
+        dh_complex = complex_inner_product(d["strain"], h, d["psd"], df, weight)
+        hh = inner_product(h, h, d["psd"], df, weight)
         ll = ll + dh_real - 0.5 * hh
         # Phase-maximised per-detector ρ² = |⟨d|h⟩|² / ⟨h|h⟩
         rho_sq = rho_sq + (dh_complex * jnp.conj(dh_complex)).real / hh
@@ -356,8 +427,23 @@ def parse_args() -> argparse.Namespace:
                    help="HDF5 file with H1/L1 time-series strain, PSD, and antenna factors")
     p.add_argument("--out", default=Path("fit_history.png"), type=Path,
                    help="Output path for the SNR-vs-mass plot")
-    p.add_argument("--tukey-alpha", type=float, default=0.1,
-                   help="Tukey window alpha applied before rFFT")
+    p.add_argument("--tukey-alpha", type=float, default=0.01,
+                   help="Tukey window alpha applied to the time series before "
+                        "rFFT. Production pipelines use ~0.01 so the taper "
+                        "only kills the FFT-wrap discontinuity, not in-band "
+                        "signal. Set 0 to disable (risky).")
+    p.add_argument("--f-taper-width", type=float, default=1.0,
+                   help="Width [Hz] of the raised-cosine onset taper applied "
+                        "symmetrically to data and template at f_min. "
+                        "Frequency-domain equivalent of PyCBC's "
+                        "taper_timeseries; suppresses Gibbs ringing from the "
+                        "hard f_min cutoff. Set 0 for a hard cut.")
+    p.add_argument("--psd-max-filter-length", type=float, default=4.0,
+                   help="Duration [s] to truncate the 1/sqrt(S_n) whitening "
+                        "kernel to before matched filtering (inverse spectrum "
+                        "truncation). Prevents the whitening filter's impulse "
+                        "response from wrapping around the segment and biasing "
+                        "the SNR. Set 0 to disable.")
     p.add_argument("--mc-init", type=float, default=1.4,
                    help="Initial chirp mass guess [Msun]")
     p.add_argument("--eta", type=float, default=0.24,
@@ -396,9 +482,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    data = load_data(args.data, tukey_alpha=args.tukey_alpha,
-                     waveform=args.waveform)
+    data = load_data(
+        args.data,
+        tukey_alpha=args.tukey_alpha,
+        waveform=args.waveform,
+        f_taper_width=args.f_taper_width,
+        psd_max_filter_length=args.psd_max_filter_length,
+    )
     print(f"Waveform template:    {args.waveform}")
+    print(f"Tukey alpha:          {args.tukey_alpha}")
+    print(f"Onset taper width:    {args.f_taper_width:.2f} Hz")
+    print(f"PSD truncation:       "
+          f"{args.psd_max_filter_length:.2f} s"
+          f"{'  (disabled)' if args.psd_max_filter_length <= 0 else ''}")
 
     truth = data["truth"]
     if truth is not None:

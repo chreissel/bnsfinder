@@ -106,6 +106,32 @@ Defaults are `--lr 0.1 --lr-final 1e-3`; pick a larger `--lr` if the
 trajectory gets stuck in a local feature. The effective LR at each step
 is recorded in `history["lr"]` and drawn alongside the SNR-vs-mass plot.
 
+### Matched-filter data conditioning
+
+`fit_waveform.py` applies three pipeline-standard preprocessing steps
+before the inner product. Defaults mirror what PyCBC/GstLAL use:
+
+- **Mild Tukey window on the segment (`--tukey-alpha 0.01`).** Kills the
+  FFT wrap-around discontinuity without eating in-band signal.
+- **Symmetric soft onset taper at `f_min` (`--f-taper-width 1.0 Hz`).**
+  A raised-cosine ramp `T(f)` rising from 0 at `f_min` to 1 at
+  `f_min + f_taper_width`, applied to both data and template as an
+  integrand factor `T(f)^2` in the inner product. Equivalent to
+  `pycbc.waveform.taper_timeseries`; suppresses Gibbs ringing from the
+  hard low-frequency cutoff. Set `--f-taper-width 0` for a hard cut.
+- **Inverse spectrum truncation (`--psd-max-filter-length 4.0 s`).**
+  The `1/sqrt(S_n)` whitening filter is iFFT'd to the time domain,
+  windowed down to the chosen duration, and FFT'd back. Prevents the
+  whitening kernel's long tail from wrapping around the segment via
+  circular FFT and biasing the SNR. Standard trick from
+  `pycbc.psd.inverse_spectrum_truncation`. Set 0 to disable.
+
+These only address what the fit can do. What they cannot fix is a
+segment that is shorter than the in-band template (e.g. a ~100 s BNS
+chirp in a 64 s kernel) — real pipelines avoid that configuration by
+using 256+ s segments. If your fit is still biased after enabling the
+above, the next thing to tune is the generator's `waveform_duration`.
+
 ### Waveform template
 
 `--waveform` selects which ripple model is used as the template:
