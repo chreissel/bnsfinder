@@ -45,7 +45,11 @@ from utils import load_config  # noqa: E402  (from submodule)
 from waveforms import generate_signals  # noqa: E402  (from submodule)
 
 from ml4gw.dataloading import Hdf5TimeSeriesDataset  # noqa: E402
-from ml4gw.gw import compute_antenna_responses, get_ifo_geometry  # noqa: E402
+from ml4gw.gw import (  # noqa: E402
+    compute_antenna_responses,
+    compute_network_snr,
+    get_ifo_geometry,
+)
 from ml4gw.transforms import SpectralDensity  # noqa: E402
 
 
@@ -124,7 +128,21 @@ def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
 
     # --- PSD onto rFFT grid of the kernel ---
     n_freqs = kernel_size // 2 + 1
-    psd_np = _interp_psd(psd[0].detach().cpu().numpy(), fs, n_freqs)
+    psd_tensor = psd
+    if psd_tensor.shape[-1] != n_freqs:
+        while psd_tensor.ndim < 3:
+            psd_tensor = psd_tensor[None]
+        psd_tensor = torch.nn.functional.interpolate(
+            psd_tensor, size=(n_freqs,), mode="linear"
+        )
+    psd_np = psd_tensor[0].detach().cpu().numpy()
+
+    # --- Truth network SNR (matches injection() convention) ---
+    network_snr = compute_network_snr(
+        responses=waveforms, psd=psd_tensor,
+        sample_rate=fs, highpass=f_min,
+    )
+    params["snr"] = network_snr
 
     strain_np = strain[0].detach().cpu().numpy()
 
