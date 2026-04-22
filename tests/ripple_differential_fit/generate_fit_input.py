@@ -127,6 +127,8 @@ def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
 
     strain_np = strain[0].detach().cpu().numpy()
 
+    right_pad = float(getattr(config.general, "right_pad", 0.0))
+
     # --- Write fit-ready HDF5 ---
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(out_path, "w") as h5:
@@ -140,6 +142,9 @@ def generate(config_path: Path, data_dir: Path, out_path: Path) -> None:
             h5.create_dataset(f"antenna/{det}/fplus", data=float(fplus[i]))
             h5.create_dataset(f"antenna/{det}/fcross", data=float(fcross[i]))
         truth = h5.create_group("truth")
+        # Coalescence time inside the stored strain window. The injection
+        # places coalescence `right_pad` seconds before the right edge.
+        truth.create_dataset("tc", data=float(kernel_length - right_pad))
         for k, v in params.items():
             if hasattr(v, "detach"):
                 arr = v.detach().cpu().numpy()

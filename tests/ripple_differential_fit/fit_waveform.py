@@ -82,13 +82,61 @@ def load_data(path: Path, tukey_alpha: float = 0.1) -> dict:
                 "fcross": float(f[f"antenna/{det}/fcross"][()]),
             }
 
+        truth = None
+        if "truth" in f:
+            truth = {k: np.asarray(v[()]) for k, v in f["truth"].items()}
+
     return {
         "freqs": jnp.asarray(freqs, dtype=jnp.float64),
         "sample_rate": fs,
         "duration": n / fs,
         "f_ref": f_ref,
+        "truth": truth,
         **detectors,
     }
+
+
+def _float(x) -> float:
+    """Coerce a numpy scalar or 0/1-d array to a python float."""
+    arr = np.asarray(x)
+    return float(arr.reshape(-1)[0])
+
+
+def init_from_truth(args: argparse.Namespace, truth: dict) -> None:
+    """Override non-mass CLI init values with truth params from HDF5.
+
+    Mutates `args` in place. Chirp mass is intentionally not overridden —
+    the fit still searches it starting from `--mc-init`.
+    """
+    if truth is None:
+        raise SystemExit("--init-from-truth requested but /truth not in HDF5")
+
+    def pick(*keys):
+        for k in keys:
+            if k in truth:
+                return _float(truth[k])
+        return None
+
+    mass_ratio = pick("mass_ratio")
+    if mass_ratio is not None:
+        q = mass_ratio
+        args.eta = q / (1.0 + q) ** 2  # symmetric mass ratio from m2/m1
+
+    for attr, keys in [
+        ("chi1", ("chi1", "s1z")),
+        ("chi2", ("chi2", "s2z")),
+        ("dist", ("distance",)),
+        ("tc", ("tc",)),
+        ("phic", ("phic",)),
+        ("inclination", ("inclination",)),
+    ]:
+        val = pick(*keys)
+        if val is not None:
+            setattr(args, attr, val)
+
+    print("[init-from-truth] starting points overridden from /truth:")
+    for attr in ("eta", "chi1", "chi2", "dist", "tc", "phic", "inclination"):
+        print(f"    {attr:12s} = {getattr(args, attr):+.6g}")
 
 
 def ripple_polarizations(theta, freqs, f_ref):
@@ -199,12 +247,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inclination", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--init-from-truth", action="store_true",
+                   help="Initialise all non-mass parameters from the /truth "
+                        "group in the HDF5 (simulation-only info; use only "
+                        "for sanity checks). Chirp mass still starts at --mc-init.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     data = load_data(args.data, tukey_alpha=args.tukey_alpha)
+
+    if args.init_from_truth:
+        init_from_truth(args, data["truth"])
 
     init_theta = [
         args.mc_init, args.eta, args.chi1, args.chi2,

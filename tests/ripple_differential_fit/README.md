@@ -72,6 +72,23 @@ chirp mass is fit. To fit additional parameters, expand
 `make_fit_fns` in `fit_waveform.py` to return gradients w.r.t. the full
 parameter vector.
 
+### Initialising non-mass parameters from truth
+
+For sanity checks you can seed every non-mass parameter from the `/truth`
+group written by `generate_fit_input.py`:
+
+```
+python fit_waveform.py --data data.h5 --init-from-truth \
+    --mc-init 10.0 --steps 300
+```
+
+With the flag set, `--eta` is derived from `truth/mass_ratio`
+(`eta = q / (1+q)^2`), and `chi1/chi2/dist/tc/phic/inclination` are
+overridden from the matching truth datasets. Chirp mass is **not**
+overridden — it still starts at `--mc-init` so there is something to fit.
+This is simulation-only information; do not use it when benchmarking
+against real strain.
+
 ## Output
 
 - `fit_history.png` — scatter of network SNR vs chirp mass, colored by
