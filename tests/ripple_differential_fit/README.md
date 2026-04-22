@@ -97,7 +97,7 @@ against real strain.
 
 ## Notes
 
-- Uses `ripple.waveforms.IMRPhenomD.gen_IMRPhenomD_polar`. For BNS with
+- Uses `ripple.waveforms.IMRPhenomD.gen_IMRPhenomD_hphc`. For BNS with
   tidal effects swap in `IMRPhenomD_NRTidalv2` and extend `theta` with
   `lambda1, lambda2`.
 - Matched-filter inner product uses `4 df Re Σ d*·h / S_n`, assuming a

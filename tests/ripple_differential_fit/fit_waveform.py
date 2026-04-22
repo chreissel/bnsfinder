@@ -40,7 +40,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-from ripple.waveforms.IMRPhenomD import gen_IMRPhenomD_polar
+from ripple.waveforms.IMRPhenomD import gen_IMRPhenomD_hphc
 from scipy.signal.windows import tukey
 
 jax.config.update("jax_enable_x64", True)
@@ -141,7 +141,7 @@ def init_from_truth(args: argparse.Namespace, truth: dict) -> None:
 
 def ripple_polarizations(theta, freqs, f_ref):
     """h+, hx in frequency domain from ripple's IMRPhenomD."""
-    hp, hc = gen_IMRPhenomD_polar(freqs, theta, f_ref)
+    hp, hc = gen_IMRPhenomD_hphc(freqs, theta, f_ref)
     return hp, hc
 
 
