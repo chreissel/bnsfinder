@@ -158,15 +158,17 @@ inserts `lambda1 = lambda2 = 0` before calling ripple.
 
 Two losses are available via `--loss`:
 
-- `--loss snr` (default) — minimise `-ρ²_net` where `ρ²_net = Σ_det |⟨d|h⟩|² / ⟨h|h⟩`
-  is the phase-maximised network SNR squared. This is the standard
-  CBC-search statistic: it is invariant under distance and insensitive
-  to the coalescence phase, so the template-vs-data match depends only
-  on the intrinsic shape.
+- `--loss snr` (default) — minimise `-ρ²_net` where, per detector,
+  `ρ²_j = max_t |z_j(t)|² / ⟨h|h⟩_j` with `z_j(t) = 4 ∫ conj(d̃_j) h̃_j e^{2πift} / S_n df`.
+  `z_j(t)` is computed via one inverse FFT per detector, so the
+  statistic is **time- and phase-maximised** just like
+  `pycbc.filter.matched_filter`. The time maximisation matters: the
+  generator applies per-detector light-travel delays (H1↔L1 up to ~10 ms)
+  via `compute_observed_strain`, and a fixed-`tc` template would be
+  dephased at ~200 Hz enough to kill the Mc gradient.
 - `--loss logl` — minimise `-(⟨d|h⟩ - ½⟨h|h⟩)`, the Gaussian
-  matched-filter log-likelihood. This uses the real inner product and
-  is sensitive to distance and phase, so it only performs well when
-  those are initialised near truth.
+  matched-filter log-likelihood at fixed `tc`. Sensitive to distance
+  and phase; only use when those are initialised near truth.
 
 ### Initialising non-mass parameters from truth
 

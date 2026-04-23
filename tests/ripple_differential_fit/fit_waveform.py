@@ -291,6 +291,22 @@ def complex_inner_product(a, b, psd, df, weight):
     return 4.0 * df * jnp.sum(integrand)
 
 
+def snr_timeseries_peak_sq(d, h, psd, weight, fs, n):
+    """Peak of the phase+time-maximised matched-filter statistic per IFO.
+
+    Builds the one-sided integrand ``T² · conj(d̃) · h̃ / S_n`` on the
+    segment rFFT grid, zero-pads to a full length-n complex spectrum
+    (negative frequencies set to 0), inverse-FFTs, and returns
+    ``max_t |z(t)|²``. Factor 4·fs matches the continuous matched-filter
+    normalisation ``z(t) = 4 ∫ conj(d̃) h̃ e^{2πift} / S_n df``.
+    """
+    integrand = weight * jnp.conj(d) * h / psd
+    full = jnp.zeros(n, dtype=jnp.complex128)
+    full = full.at[: integrand.shape[0]].set(integrand)
+    z = 4.0 * fs * jnp.fft.ifft(full)
+    return jnp.max(jnp.abs(z) ** 2)
+
+
 def network_stats(theta, data):
     """Compute (log_likelihood, rho_sq_net, rho_net) for one parameter set."""
     freqs = data["freqs"]
@@ -344,11 +360,17 @@ def network_stats(theta, data):
         d = data[det]
         h = project(hp, hc, d["fplus"], d["fcross"])
         dh_real = inner_product(d["strain"], h, d["psd"], df, weight)
-        dh_complex = complex_inner_product(d["strain"], h, d["psd"], df, weight)
         hh = inner_product(h, h, d["psd"], df, weight)
         ll = ll + dh_real - 0.5 * hh
-        # Phase-maximised per-detector ρ² = |⟨d|h⟩|² / ⟨h|h⟩
-        rho_sq = rho_sq + (dh_complex * jnp.conj(dh_complex)).real / hh
+        # Time- and phase-maximised per-detector ρ² = max_t |z(t)|² / ⟨h|h⟩.
+        # The maximum over t absorbs sub-sample light-travel delays between
+        # H1 and L1 (compute_observed_strain rolls each detector's strain by
+        # the geocenter↔ifo delay), which otherwise dephase the template at
+        # fixed tc and kill the Mc gradient.
+        peak = snr_timeseries_peak_sq(
+            d["strain"], h, d["psd"], weight, fs, seg_N,
+        )
+        rho_sq = rho_sq + peak / hh
     return ll, rho_sq, jnp.sqrt(rho_sq)
 
 
