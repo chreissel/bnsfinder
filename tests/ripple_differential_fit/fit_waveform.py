@@ -307,8 +307,13 @@ def snr_timeseries_peak_sq(d, h, psd, weight, fs, n):
     return jnp.max(jnp.abs(z) ** 2)
 
 
-def network_stats(theta, data):
-    """Compute (log_likelihood, rho_sq_net, rho_net) for one parameter set."""
+def network_stats(theta, data, detectors=DETECTORS):
+    """Compute (log_likelihood, rho_sq, rho) summed over ``detectors``.
+
+    Passing a length-1 tuple (e.g. ``("H1",)``) yields the single-IFO
+    statistic; the default sums over both H1 and L1 for the network
+    statistic.
+    """
     freqs = data["freqs"]
     mask = data["mask"]
     weight = data["weight"]
@@ -356,7 +361,7 @@ def network_stats(theta, data):
 
     ll = jnp.array(0.0)
     rho_sq = jnp.array(0.0)
-    for det in DETECTORS:
+    for det in detectors:
         d = data[det]
         h = project(hp, hc, d["fplus"], d["fcross"])
         dh_real = inner_product(d["strain"], h, d["psd"], df, weight)
@@ -374,12 +379,17 @@ def network_stats(theta, data):
     return ll, rho_sq, jnp.sqrt(rho_sq)
 
 
-def make_fit_fns(data, fixed_rest, loss_kind: str = "snr"):
+def make_fit_fns(data, fixed_rest, loss_kind: str = "snr",
+                 detectors: tuple = DETECTORS):
     """Return jitted loss, grad and SNR functions that take only chirp mass.
 
     loss_kind:
-        "snr"  — minimise -ρ²_net (maximise phase-maximised network SNR²).
-        "logl" — minimise -log L (Gaussian matched-filter log-likelihood).
+        "snr"  — minimise -ρ² summed over ``detectors`` (phase-maximised).
+        "logl" — minimise -log L summed over ``detectors``.
+    detectors:
+        Tuple of IFO names to include in the statistic. Use the full
+        ``DETECTORS`` tuple for the network SNR, or a length-1 tuple for
+        a single-detector fit.
     """
     fixed_rest = jnp.asarray(fixed_rest, dtype=jnp.float64)
 
@@ -388,17 +398,17 @@ def make_fit_fns(data, fixed_rest, loss_kind: str = "snr"):
 
     if loss_kind == "snr":
         def loss(mc):
-            _, rho_sq, _ = network_stats(theta_of(mc), data)
+            _, rho_sq, _ = network_stats(theta_of(mc), data, detectors)
             return -rho_sq
     elif loss_kind == "logl":
         def loss(mc):
-            ll, _, _ = network_stats(theta_of(mc), data)
+            ll, _, _ = network_stats(theta_of(mc), data, detectors)
             return -ll
     else:
         raise ValueError(f"Unknown loss_kind: {loss_kind!r}")
 
     def snr(mc):
-        _, _, s = network_stats(theta_of(mc), data)
+        _, _, s = network_stats(theta_of(mc), data, detectors)
         return s
 
     return jax.jit(jax.value_and_grad(loss)), jax.jit(snr)
@@ -425,10 +435,13 @@ def _build_schedule(lr: float, lr_final: float, n_steps: int, kind: str):
 
 
 def fit(data, init_theta, n_steps: int, lr: float, loss_kind: str = "snr",
-        lr_final: float | None = None, lr_schedule: str = "cosine"):
+        lr_final: float | None = None, lr_schedule: str = "cosine",
+        detectors: tuple = DETECTORS):
     init_theta = np.asarray(init_theta, dtype=np.float64)
     mc = jnp.asarray(init_theta[0])
-    loss_grad_fn, snr_fn = make_fit_fns(data, init_theta[1:], loss_kind)
+    loss_grad_fn, snr_fn = make_fit_fns(
+        data, init_theta[1:], loss_kind, detectors,
+    )
 
     schedule = _build_schedule(lr, lr_final, n_steps, lr_schedule)
     opt = optax.adam(schedule)
@@ -452,7 +465,9 @@ def fit(data, init_theta, n_steps: int, lr: float, loss_kind: str = "snr",
     return float(mc), history
 
 
-def plot_history(history, out_path: Path, truth: dict | None = None) -> None:
+def plot_history(history, out_path: Path, truth: dict | None = None,
+                 snr_truth_key: str = "snr",
+                 snr_label: str = "network SNR") -> None:
     mcs = np.asarray(history["mc"])
     snrs = np.asarray(history["snr"])
     lrs = np.asarray(history.get("lr", []))
@@ -473,13 +488,13 @@ def plot_history(history, out_path: Path, truth: dict | None = None) -> None:
         if "chirp_mass" in truth:
             ax.axvline(_float(truth["chirp_mass"]), ls="--", color="crimson",
                        lw=1, alpha=0.7, label="truth $\\mathcal{M}$")
-        if "snr" in truth:
-            ax.axhline(_float(truth["snr"]), ls="--", color="navy",
-                       lw=1, alpha=0.7, label="truth network SNR")
+        if snr_truth_key in truth:
+            ax.axhline(_float(truth[snr_truth_key]), ls="--", color="navy",
+                       lw=1, alpha=0.7, label=f"truth {snr_label}")
         if ax.get_legend_handles_labels()[0]:
             ax.legend(loc="best", fontsize=9)
     ax.set_xlabel(r"Chirp mass $\mathcal{M}$ [$M_\odot$]")
-    ax.set_ylabel("Network SNR")
+    ax.set_ylabel(snr_label[0].upper() + snr_label[1:])
     ax.set_title("Differential fit trajectory")
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Iteration")
@@ -562,6 +577,11 @@ def parse_args() -> argparse.Namespace:
                         "phase-maximised network SNR squared (standard CBC "
                         "search statistic, distance-independent); 'logl' "
                         "maximises the Gaussian matched-filter log-likelihood.")
+    p.add_argument("--detector", choices=("network", "H1", "L1"),
+                   default="network",
+                   help="Which detector(s) to include in the fit statistic. "
+                        "'network' (default) sums ρ²_H1 + ρ²_L1; 'H1' / 'L1' "
+                        "fit a single IFO in isolation for diagnostics.")
     return p.parse_args()
 
 
@@ -584,12 +604,27 @@ def main() -> None:
     print(f"Template eval grid:   {args.template_eval_factor}x segment "
           f"({args.template_eval_factor * data['duration']:.1f} s)")
 
+    if args.detector == "network":
+        detectors = DETECTORS
+        snr_truth_key = "snr"
+        snr_label = "network SNR"
+    else:
+        detectors = (args.detector,)
+        snr_truth_key = f"snr_{args.detector}"
+        snr_label = f"{args.detector} SNR"
+    print(f"Fit statistic:        {snr_label} "
+          f"(detectors: {', '.join(detectors)})")
+
     truth = data["truth"]
     if truth is not None:
         if "chirp_mass" in truth:
             print(f"Truth chirp mass:     {_float(truth['chirp_mass']):.4f} Msun")
         if "snr" in truth:
             print(f"Truth network SNR:    {_float(truth['snr']):.3f}")
+        for det in DETECTORS:
+            key = f"snr_{det}"
+            if key in truth:
+                print(f"Truth {det} SNR:         {_float(truth[key]):.3f}")
 
     if args.init_from_truth:
         init_from_truth(args, truth)
@@ -601,11 +636,13 @@ def main() -> None:
     mc_fit, history = fit(data, init_theta, n_steps=args.steps, lr=args.lr,
                           loss_kind=args.loss,
                           lr_final=args.lr_final,
-                          lr_schedule=args.lr_schedule)
+                          lr_schedule=args.lr_schedule,
+                          detectors=detectors)
 
     print(f"Recovered chirp mass: {mc_fit:.4f} Msun")
-    print(f"Final network SNR:    {history['snr'][-1]:.3f}")
-    plot_history(history, args.out, truth=truth)
+    print(f"Final {snr_label}: {history['snr'][-1]:.3f}")
+    plot_history(history, args.out, truth=truth,
+                 snr_truth_key=snr_truth_key, snr_label=snr_label)
     print(f"Wrote {args.out}")
 
 

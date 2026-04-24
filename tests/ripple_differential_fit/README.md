@@ -35,7 +35,10 @@ python generate_fit_input.py \
 
 Download background data once with the submodule's `load_data.py`. Truth
 parameters sampled during generation are preserved under `/truth` in the
-output HDF5 for comparison against the fit.
+output HDF5 for comparison against the fit. Alongside `/truth/snr`
+(network), the generator also writes per-IFO truth SNRs
+(`/truth/snr_H1`, `/truth/snr_L1`) via `ml4gw.gw.compute_ifo_snr`, so a
+single-detector fit can be compared against the matching truth value.
 
 The generator mirrors upstream `injections.py` in two places:
 
@@ -169,6 +172,16 @@ Two losses are available via `--loss`:
 - `--loss logl` — minimise `-(⟨d|h⟩ - ½⟨h|h⟩)`, the Gaussian
   matched-filter log-likelihood at fixed `tc`. Sensitive to distance
   and phase; only use when those are initialised near truth.
+
+`--detector` picks which IFO(s) enter the sum. `network` (default)
+sums `ρ²_H1 + ρ²_L1`; `H1` or `L1` restricts the statistic to a single
+detector for diagnostics. Note the network sum is **incoherent** —
+each detector's peak is chosen independently by `max_t |z_j(t)|²`, so
+H1 and L1 are not constrained to share a common geocentric arrival
+time (this matches coincident-search conventions, not coherent ones).
+The plot's horizontal truth line follows the `--detector` choice
+(`/truth/snr` for `network`, `/truth/snr_H1` or `/truth/snr_L1`
+otherwise).
 
 ### Initialising non-mass parameters from truth
 

@@ -49,6 +49,7 @@ import importlib  # noqa: E402
 from ml4gw.dataloading import Hdf5TimeSeriesDataset  # noqa: E402
 from ml4gw.gw import (  # noqa: E402
     compute_antenna_responses,
+    compute_ifo_snr,
     compute_network_snr,
     get_ifo_geometry,
     reweight_snrs,
@@ -165,12 +166,18 @@ def generate(
 
     psd_np = psd_tensor[0].detach().cpu().numpy()
 
-    # --- Truth network SNR on the (possibly reweighted) waveforms ---
+    # --- Truth network + per-IFO SNR on the (possibly reweighted) waveforms ---
     network_snr = compute_network_snr(
         responses=waveforms, psd=psd_tensor,
         sample_rate=fs, highpass=f_min,
     )
+    ifo_snrs = compute_ifo_snr(
+        responses=waveforms, psd=psd_tensor,
+        sample_rate=fs, highpass=f_min,
+    )  # [batch, n_ifos]
     params["snr"] = network_snr
+    for i, det in enumerate(ifos):
+        params[f"snr_{det}"] = ifo_snrs[:, i]
 
     strain_np = strain[0].detach().cpu().numpy()
 
@@ -205,6 +212,10 @@ def generate(
         print(f"  truth chirp_mass = {float(params['chirp_mass'][0]):.4f} Msun")
     if "snr" in params:
         print(f"  truth network SNR = {float(params['snr'][0]):.3f}")
+    for det in ifos:
+        key = f"snr_{det}"
+        if key in params:
+            print(f"  truth {det} SNR = {float(params[key][0]):.3f}")
 
 
 def parse_args() -> argparse.Namespace:
