@@ -162,13 +162,24 @@ inserts `lambda1 = lambda2 = 0` before calling ripple.
 Two losses are available via `--loss`:
 
 - `--loss snr` (default) — minimise `-ρ²_net` where, per detector,
-  `ρ²_j = max_t |z_j(t)|² / ⟨h|h⟩_j` with `z_j(t) = 4 ∫ conj(d̃_j) h̃_j e^{2πift} / S_n df`.
-  `z_j(t)` is computed via one inverse FFT per detector, so the
-  statistic is **time- and phase-maximised** just like
-  `pycbc.filter.matched_filter`. The time maximisation matters: the
-  generator applies per-detector light-travel delays (H1↔L1 up to ~10 ms)
-  via `compute_observed_strain`, and a fixed-`tc` template would be
-  dephased at ~200 Hz enough to kill the Mc gradient.
+  `ρ²_j = max_{|t| ≤ Δt} |z_j(t)|² / ⟨h|h⟩_j` with
+  `z_j(t) = 4 ∫ conj(d̃_j) h̃_j e^{2πift} / S_n df`. `z_j(t)` is computed
+  via one inverse FFT per detector, so the statistic is **time- and
+  phase-maximised** just like `pycbc.filter.matched_filter`. The time
+  maximisation matters: the generator applies per-detector light-travel
+  delays (H1↔L1 up to ~10 ms) via `compute_observed_strain`, and a
+  fixed-`tc` template would be dephased at ~200 Hz enough to kill the
+  Mc gradient.
+
+  The max is taken over a narrow circular window `|t| ≤ Δt`
+  (`--max-time-shift`, default 50 ms) centred on the template's `tc`,
+  not the full 64 s segment. Searching every sample lets `|z(t)|²`
+  saturate its Cauchy–Schwarz ceiling `⟨d|d⟩` on a noise-aligned
+  template — for a 2-IFO LIGO segment at 64 s duration that ceiling is
+  ~500, so the optimiser would report ρ ≈ 500 regardless of the true
+  signal SNR (~14). Restricting to ±50 ms covers every physical
+  light-travel delay with margin while keeping the noise ceiling near
+  the true-signal SNR.
 - `--loss logl` — minimise `-(⟨d|h⟩ - ½⟨h|h⟩)`, the Gaussian
   matched-filter log-likelihood at fixed `tc`. Sensitive to distance
   and phase; only use when those are initialised near truth.

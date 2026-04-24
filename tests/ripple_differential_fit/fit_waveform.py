@@ -111,7 +111,8 @@ def load_data(path: Path, tukey_alpha: float = 0.01,
               waveform: str = "imrphenomd",
               f_taper_width: float = 1.0,
               psd_max_filter_length: float = 4.0,
-              template_eval_factor: int = 4) -> dict:
+              template_eval_factor: int = 4,
+              max_time_shift: float = 0.05) -> dict:
     with h5py.File(path, "r") as f:
         fs = float(f.attrs["sample_rate"])
         f_ref = float(f.attrs["f_ref"])
@@ -189,6 +190,7 @@ def load_data(path: Path, tukey_alpha: float = 0.01,
         "segment_N": int(n),
         "tc_offset": float(tc_offset),
         "tukey_td": jnp.asarray(tukey_win_td, dtype=jnp.float64),
+        "max_time_shift": float(max_time_shift),
         "sample_rate": fs,
         "duration": n / fs,
         "f_ref": f_ref,
@@ -291,20 +293,35 @@ def complex_inner_product(a, b, psd, df, weight):
     return 4.0 * df * jnp.sum(integrand)
 
 
-def snr_timeseries_peak_sq(d, h, psd, weight, fs, n):
+def snr_timeseries_peak_sq(d, h, psd, weight, fs, n, max_time_shift: float):
     """Peak of the phase+time-maximised matched-filter statistic per IFO.
 
     Builds the one-sided integrand ``T² · conj(d̃) · h̃ / S_n`` on the
     segment rFFT grid, zero-pads to a full length-n complex spectrum
     (negative frequencies set to 0), inverse-FFTs, and returns
-    ``max_t |z(t)|²``. Factor 4·fs matches the continuous matched-filter
-    normalisation ``z(t) = 4 ∫ conj(d̃) h̃ e^{2πift} / S_n df``.
+    ``max_{|t| <= max_time_shift} |z(t)|²``. Factor 4·fs matches the
+    continuous matched-filter normalisation
+    ``z(t) = 4 ∫ conj(d̃) h̃ e^{2πift} / S_n df``.
+
+    The max is restricted to ``|t| <= max_time_shift`` (circular around 0)
+    instead of the full segment. Searching every one of the ``n`` sample
+    shifts was pushing the statistic up against its Cauchy–Schwarz ceiling
+    ``⟨d|d⟩`` (~500 for LIGO at 64 s duration, 2 IFOs), letting the
+    optimiser find noise-aligned templates that report ρ² ≫ ⟨h_true|h_true⟩.
+    The physical reason to time-maximise is to absorb the per-IFO
+    light-travel delay applied by ``compute_observed_strain`` (≤ 10 ms
+    for H1↔L1); ±~50 ms covers that with margin while keeping the noise
+    ceiling near the true signal SNR.
     """
     integrand = weight * jnp.conj(d) * h / psd
     full = jnp.zeros(n, dtype=jnp.complex128)
     full = full.at[: integrand.shape[0]].set(integrand)
     z = 4.0 * fs * jnp.fft.ifft(full)
-    return jnp.max(jnp.abs(z) ** 2)
+    # Circular |t| on the iFFT grid: t_m = min(m, n - m) / fs.
+    m = jnp.arange(n)
+    t_abs = jnp.minimum(m, n - m).astype(jnp.float64) / fs
+    in_window = t_abs <= max_time_shift
+    return jnp.max(jnp.where(in_window, jnp.abs(z) ** 2, -jnp.inf))
 
 
 def network_stats(theta, data, detectors=DETECTORS):
@@ -331,6 +348,7 @@ def network_stats(theta, data, detectors=DETECTORS):
     eval_N = data["eval_N"]
     seg_N = data["segment_N"]
     tc_offset = data["tc_offset"]
+    max_time_shift = data["max_time_shift"]
 
     # Shift the user-facing tc (defined on the segment) into the eval
     # window so the coalescence lands at the same offset from the right
@@ -373,7 +391,7 @@ def network_stats(theta, data, detectors=DETECTORS):
         # the geocenter↔ifo delay), which otherwise dephase the template at
         # fixed tc and kill the Mc gradient.
         peak = snr_timeseries_peak_sq(
-            d["strain"], h, d["psd"], weight, fs, seg_N,
+            d["strain"], h, d["psd"], weight, fs, seg_N, max_time_shift,
         )
         rho_sq = rho_sq + peak / hh
     return ll, rho_sq, jnp.sqrt(rho_sq)
@@ -544,6 +562,17 @@ def parse_args() -> argparse.Namespace:
                         "in-band inspiral does not wrap around the segment. "
                         "Increase if your BNS chirp is longer than "
                         "factor * T - T (e.g. very low Mc at f_min = 20 Hz).")
+    p.add_argument("--max-time-shift", type=float, default=0.05,
+                   help="Half-width [s] of the circular window over which the "
+                        "matched filter ρ²_j = max_t |z_j(t)|² / ⟨h|h⟩_j is "
+                        "time-maximised, per detector. The only physical reason "
+                        "to search in t is to absorb the geocenter↔IFO "
+                        "light-travel delay (≤ 10 ms for H1↔L1) that "
+                        "compute_observed_strain applies; 50 ms covers that "
+                        "with margin. Searching the full segment instead lets "
+                        "|z(t)|² saturate its Cauchy–Schwarz bound ⟨d|d⟩ on a "
+                        "noise-aligned template, which drives the optimiser to "
+                        "ρ ~ 500 regardless of the true signal SNR.")
     p.add_argument("--mc-init", type=float, default=1.4,
                    help="Initial chirp mass guess [Msun]")
     p.add_argument("--eta", type=float, default=0.24,
@@ -594,6 +623,7 @@ def main() -> None:
         f_taper_width=args.f_taper_width,
         psd_max_filter_length=args.psd_max_filter_length,
         template_eval_factor=args.template_eval_factor,
+        max_time_shift=args.max_time_shift,
     )
     print(f"Waveform template:    {args.waveform}")
     print(f"Tukey alpha:          {args.tukey_alpha}")
@@ -603,6 +633,7 @@ def main() -> None:
           f"{'  (disabled)' if args.psd_max_filter_length <= 0 else ''}")
     print(f"Template eval grid:   {args.template_eval_factor}x segment "
           f"({args.template_eval_factor * data['duration']:.1f} s)")
+    print(f"Max time shift:       ±{args.max_time_shift * 1e3:.0f} ms")
 
     if args.detector == "network":
         detectors = DETECTORS
