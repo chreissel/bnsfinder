@@ -134,6 +134,7 @@ def generate(
     # matches a draw from the snr_reweighting distribution in the config.
     # Without this the SNR is whatever the sampled distance yields, which
     # for typical distance priors (e.g. PowerLaw[100,1000,2]) is low.
+    amplitude_scale = 1.0
     if reweight and hasattr(config, "snr_reweighting"):
         func_path = config.snr_reweighting.func
         module_name, func_name = func_path.rsplit(".", 1)
@@ -143,11 +144,33 @@ def generate(
             .sample((config.general.batch_size,))
             .to(device)
         )
+
+        # SNR before reweighting (at the original sampled distance)
+        pre_snr = compute_network_snr(
+            responses=waveforms, psd=psd_tensor,
+            sample_rate=fs, highpass=f_min,
+        )
+
         waveforms = reweight_snrs(
             responses=waveforms, target_snrs=target_snrs,
             psd=psd_tensor, sample_rate=fs, highpass=f_min,
         )
 
+        # SNR after reweighting (matches target_snrs up to numerics)
+        post_snr = compute_network_snr(
+            responses=waveforms, psd=psd_tensor,
+            sample_rate=fs, highpass=f_min,
+        )
+
+        # Per-event amplitude scale factor (batch dim has size 1)
+        amplitude_scale = float((post_snr / pre_snr)[0])
+
+        # Make truth params consistent with the injected (rescaled) signal.
+        # Amplitude ∝ 1 / distance, so divide distance by the scale factor.
+        for key in ("distance", "luminosity_distance"):
+            if key in params:
+                params[key] = params[key] / amplitude_scale
+    
     # Match injections.py padding: drop fduration/2 from each edge of kernel.
     pad = int(fduration / 2 * fs)
     injected = kernel.detach().clone()
@@ -165,6 +188,12 @@ def generate(
     fcross = antenna[0, 1, :].detach().cpu().numpy()
 
     psd_np = psd_tensor[0].detach().cpu().numpy()
+
+    # In generate_fit_input.py, before the SNR computation:
+    print(f"Full waveform: {waveforms.shape[-1]} samples ({waveforms.shape[-1]/fs:.2f}s)")
+    print(f"kernel_size:   {kernel_size} samples ({kernel_size/fs:.2f}s)")
+    print(f"Truncation keeps: {kernel_size}/{waveforms.shape[-1]} = "
+      f"{kernel_size/waveforms.shape[-1]*100:.1f}%")
 
     # --- Truth network + per-IFO SNR on the (possibly reweighted) waveforms ---
     network_snr = compute_network_snr(
