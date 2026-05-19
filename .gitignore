@@ -10,7 +10,6 @@ venv/
 *.hdf5
 *.npz
 *.png
-!tests/**/examples/*.png
 
 # Editor / OS
 .idea/
