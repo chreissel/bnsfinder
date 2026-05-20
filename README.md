@@ -1,4 +1,4 @@
-# ripple_differential_fit
+# Wavetune
 
 Differential fitting of a [ripple](https://github.com/tedwards2412/ripple)
 gravitational-wave waveform to H1/L1 strain data. The chirp mass is
@@ -9,17 +9,6 @@ Upstream dataset generator
 [`GWDatasetGeneration`](https://github.com/chreissel/GWDatasetGeneration)
 is vendored as a git submodule under `GWDatasetGeneration/` and is used
 to produce the fit input.
-
-## Repository layout
-
-```
-FirstTests.ipynb        step-by-step walkthrough of all the building blocks
-fit_waveforms.py        standalone network chirp-mass fit (no notebook)
-generate_fit_input.py   build a single-event HDF5 from GWDatasetGeneration
-example_data/           pre-baked BBH events (high / low network SNR)
-scripts/make_data_plots.py   regenerate the README data-overview plots
-plots/                  PNGs embedded below
-```
 
 ## Install
 
@@ -75,15 +64,13 @@ The generator mirrors upstream `injections.py`:
 
 ## What the data looks like
 
-Raw 8-second, 4096 Hz strain at both detectors — a high-SNR BBH chirp
-buried in real O3a noise:
+So far, we only tested on signals from binary-black-hole merging. The data contains two, 8-second long strains from both detectors (sampled at 4096 Hz) with real O3a noise:
 
 ![Strain time series](plots/strain_timeseries.png)
 
 The PSDs are the H1 and L1 noise floors over the same segment. The
 band `[f_min, f_max]` used in the inner product (default `[20, fs/2]`)
-keeps the `f = 0` bin (where ripple's IMRPhenomD is NaN and the PSD is
-~0) out of the sum:
+keeps the `f = 0` bin out of the sum:
 
 ![PSDs](plots/psd.png)
 
@@ -92,45 +79,6 @@ the chirp visible by eye; the Q-transform shows the characteristic
 frequency sweep ramping up to merger at `truth/tc`:
 
 ![Whitened + Q-transform](plots/whitened_qtransform.png)
-
-## What the notebook does
-
-`FirstTests.ipynb` walks through every component, in order:
-
-1. **Load** the HDF5 event and unpack arrays / truth parameters into a
-   ripple parameter vector `[Mc, η, χ1, χ2, D, tc, φc, ι]`.
-2. **Visualise** the raw and whitened strain plus a Q-transform around
-   the merger (the plots above).
-3. **Baseline matched filter at truth parameters.** Builds `d̃(f)` by
-   FFT'ing a Tukey-windowed strain segment, generates the template
-   `h̃(f) = F+·h+ + F×·h×` on the rFFT grid, and computes
-   `√⟨h|h⟩` to confirm it matches the stored per-IFO truth SNR.
-4. **Time-maximised matched filter.** Zero-pads the one-sided
-   integrand `conj(d̃)·h̃ / S_n` back to length N, inverse-FFTs it to
-   get `z(t)`, and recovers the coalescence-time shift from
-   `argmax |z(t)|`.
-5. **Fit chirp mass with JAX** (single IFO) — `differential_matched_filter`
-   regenerates the template at each Mc and gradient-descends on
-   `-max_t |z(t)|² / ⟨h|h⟩`. The `max_t` step absorbs the merger-time
-   drift induced by changes in Mc, so tc need not be fit.
-6. **Fit arrival time alone.** `differential_matched_filter_tc`
-   phase-shifts the truth template by `exp(-2πi f Δtc)` (FT shift
-   theorem — no template regeneration) and gradient-descends on
-   `-|⟨d|h_{Δtc}⟩|² / ⟨h|h⟩`.
-7. **Joint Mc + Δtc fit.** `differential_matched_filter_joint`
-   combines both: phase-maximised SNR² (no `max_t`) so Δtc has a real
-   gradient signal instead of being absorbed by the time-max.
-8. **Network fit.** `differential_matched_filter_network` sums the
-   time-maximised ρ² across H1 and L1, each with its own
-   `(d̃, S_n, F+, F×)`. This is exactly the loss exported by
-   `fit_waveforms.py`.
-9. **Network fit with PyTorch + ml4gw.** `network_loss_torch` rebuilds
-   the exact same network fit on PyTorch autograd, using
-   `ml4gw.waveforms.IMRPhenomD` (the model `GWDatasetGeneration` uses to
-   make the injections) instead of `ripple`. Two shims make the ml4gw
-   waveform differentiable — a detached `torch.heaviside` and an
-   out-of-place `phenom_d_mrd_amp` — and the recovered chirp mass /
-   network SNR match the JAX fit, since matched-filter ρ is normalised.
 
 ## `fit_waveforms.py` — the network fit, scripted
 
@@ -169,16 +117,6 @@ SNR within the last few iterations:
 ![Network chirp-mass fit](plots/fit_history.png)
 
 Stdout reports the initial / final / truth (Mc, ρ_net) triple.
-
-## Regenerating the README plots
-
-```
-python scripts/make_data_plots.py                       # data overview
-python fit_waveforms.py --out plots/fit_history.png     # fit trajectory
-```
-
-Plots write to `plots/` and are committed; everything else under
-`*.png` stays gitignored.
 
 ## Notes
 
