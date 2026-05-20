@@ -124,6 +124,13 @@ frequency sweep ramping up to merger at `truth/tc`:
    time-maximised ρ² across H1 and L1, each with its own
    `(d̃, S_n, F+, F×)`. This is exactly the loss exported by
    `fit_waveforms.py`.
+9. **Network fit with PyTorch + ml4gw.** `network_loss_torch` rebuilds
+   the exact same network fit on PyTorch autograd, using
+   `ml4gw.waveforms.IMRPhenomD` (the model `GWDatasetGeneration` uses to
+   make the injections) instead of `ripple`. Two shims make the ml4gw
+   waveform differentiable — a detached `torch.heaviside` and an
+   out-of-place `phenom_d_mrd_amp` — and the recovered chirp mass /
+   network SNR match the JAX fit, since matched-filter ρ is normalised.
 
 ## `fit_waveforms.py` — the network fit, scripted
 
