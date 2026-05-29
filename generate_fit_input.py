@@ -14,12 +14,18 @@ estimation and antenna-response extraction, and writes a single-event
 HDF5 in the fit-expected layout. Truth parameters are preserved under
 a `/truth` group for downstream comparison.
 
-Run:
+Run an SNR sweep (writes example_data/data_BBH_snr10.h5 ... snr100.h5):
 
     python generate_fit_input.py \
         --config GWDatasetGeneration/configs/config_BBH.yaml \
-        --data  /path/to/background_data \
-        --out   data.h5
+        --data   /path/to/background_data
+
+Generate a single event at a fixed network SNR:
+
+    python generate_fit_input.py \
+        --config GWDatasetGeneration/configs/config_BBH.yaml \
+        --data   /path/to/background_data \
+        --out    data.h5 --target-snr 30
 """
 
 from __future__ import annotations
@@ -71,6 +77,7 @@ def generate(
     data_dir: Path,
     out_path: Path,
     reweight: bool = True,
+    target_snr: float | None = None,
 ) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = load_config(str(config_path))
@@ -134,16 +141,27 @@ def generate(
     # matches a draw from the snr_reweighting distribution in the config.
     # Without this the SNR is whatever the sampled distance yields, which
     # for typical distance priors (e.g. PowerLaw[100,1000,2]) is low.
+    # When `target_snr` is given, the waveform is rescaled to exactly that
+    # network SNR, overriding the sampled distribution. Otherwise, if the
+    # config defines `snr_reweighting`, the target is drawn from it.
     amplitude_scale = 1.0
-    if reweight and hasattr(config, "snr_reweighting"):
-        func_path = config.snr_reweighting.func
-        module_name, func_name = func_path.rsplit(".", 1)
-        func = getattr(importlib.import_module(module_name), func_name)
-        target_snrs = (
-            func(*config.snr_reweighting.args)
-            .sample((config.general.batch_size,))
-            .to(device)
-        )
+    do_reweight = target_snr is not None or (
+        reweight and hasattr(config, "snr_reweighting")
+    )
+    if do_reweight:
+        if target_snr is not None:
+            target_snrs = torch.full(
+                (config.general.batch_size,), float(target_snr), device=device
+            )
+        else:
+            func_path = config.snr_reweighting.func
+            module_name, func_name = func_path.rsplit(".", 1)
+            func = getattr(importlib.import_module(module_name), func_name)
+            target_snrs = (
+                func(*config.snr_reweighting.args)
+                .sample((config.general.batch_size,))
+                .to(device)
+            )
 
         # SNR before reweighting (at the original sampled distance)
         pre_snr = compute_network_snr(
@@ -247,6 +265,36 @@ def generate(
             print(f"  truth {det} SNR = {float(params[key][0]):.3f}")
 
 
+def snr_grid(snr_min: float, snr_max: float, snr_step: float) -> list[float]:
+    """Inclusive [snr_min, snr_max] grid in steps of snr_step, drift-free."""
+    n = int(round((snr_max - snr_min) / snr_step)) + 1
+    return [round(snr_min + i * snr_step, 6) for i in range(n)]
+
+
+def generate_snr_grid(
+    config_path: Path,
+    data_dir: Path,
+    out_dir: Path,
+    label: str,
+    snrs: list[float],
+) -> None:
+    """Generate one event per target network SNR into `out_dir`.
+
+    Files are named ``data_<label>_snr<snr>.h5`` (e.g. data_BBH_snr10.h5).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for snr in snrs:
+        out_path = out_dir / f"data_{label}_snr{snr:g}.h5"
+        print(f"\n=== target network SNR = {snr:g}  ->  {out_path} ===")
+        generate(config_path, data_dir, out_path, reweight=True, target_snr=snr)
+
+
+def _label_from_config(config_path: Path) -> str:
+    """Derive the signal-type label from the config name (config_BBH -> BBH)."""
+    stem = config_path.stem
+    return stem[len("config_"):] if stem.startswith("config_") else stem
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -256,19 +304,50 @@ def parse_args() -> argparse.Namespace:
                    help="GWDatasetGeneration config yaml")
     p.add_argument("--data", required=True, type=Path,
                    help="Directory with background HDF5 files")
-    p.add_argument("--out", default=Path("data.h5"), type=Path,
-                   help="Output fit-ready HDF5 file")
+    p.add_argument("--out-dir", default=Path("example_data"), type=Path,
+                   help="Output directory for the SNR sweep "
+                        "(default: example_data).")
+    p.add_argument("--label", default=None,
+                   help="Signal-type label used in the filename "
+                        "(data_<label>_snr<snr>.h5). Defaults to the config "
+                        "stem, e.g. config_BBH.yaml -> BBH.")
+    p.add_argument("--snr-min", type=float, default=10.0,
+                   help="First target network SNR in the sweep.")
+    p.add_argument("--snr-max", type=float, default=100.0,
+                   help="Last target network SNR in the sweep.")
+    p.add_argument("--snr-step", type=float, default=10.0,
+                   help="Spacing between target SNRs in the sweep.")
+    p.add_argument("--out", type=Path, default=None,
+                   help="Single-event output path. If set, one event is "
+                        "written instead of the SNR sweep.")
+    p.add_argument("--target-snr", type=float, default=None,
+                   help="Fix the network SNR (single-event mode). Without it "
+                        "the SNR follows the config's snr_reweighting.")
     p.add_argument("--no-reweight", action="store_true",
-                   help="Skip the SNR reweighting step (config.snr_reweighting). "
-                        "By default the waveform amplitude is rescaled so the "
-                        "network SNR matches a draw from that distribution, "
-                        "mirroring GWDatasetGeneration/injections.py.")
+                   help="Single-event mode only: skip SNR reweighting and use "
+                        "the raw distance-implied SNR. Ignored when a target "
+                        "SNR is set (the sweep always reweights).")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    generate(args.config, args.data, args.out, reweight=not args.no_reweight)
+
+    # Single-event mode (back-compatible with the original CLI).
+    if args.out is not None:
+        generate(
+            args.config, args.data, args.out,
+            reweight=not args.no_reweight, target_snr=args.target_snr,
+        )
+        return
+
+    # SNR sweep into --out-dir.
+    label = args.label or _label_from_config(args.config)
+    snrs = snr_grid(args.snr_min, args.snr_max, args.snr_step)
+    print(f"Generating {len(snrs)} {label} events at network SNR "
+          f"{snrs[0]:g}..{snrs[-1]:g} (step {args.snr_step:g}) "
+          f"into {args.out_dir}")
+    generate_snr_grid(args.config, args.data, args.out_dir, label, snrs)
 
 
 if __name__ == "__main__":
