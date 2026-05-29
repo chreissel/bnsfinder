@@ -42,22 +42,38 @@ attrs: sample_rate, f_min, f_max, f_ref, duration
 
 Two pre-generated BBH events live in `example_data/`
 (`data_BBH_highSNR.h5`, `data_BBH_lowSNR.h5`). Make your own with
-`generate_fit_input.py`:
+`generate_fit_input.py`.
+
+By default it sweeps the target network SNR from 10 to 100 in steps of
+10, writing one event per SNR into `example_data/`:
+
+```
+python generate_fit_input.py \
+    --config GWDatasetGeneration/configs/config_BBH.yaml \
+    --data   /path/to/background_data
+# -> example_data/data_BBH_snr10.h5 ... example_data/data_BBH_snr100.h5
+```
+
+The filename label (`BBH`) is taken from the config name and the SNR
+from each sweep step (`data_<label>_snr<snr>.h5`). Tune the sweep with
+`--snr-min/--snr-max/--snr-step`, the destination with `--out-dir`, and
+override the label with `--label`. For a single event, pass `--out`
+(optionally with `--target-snr` to fix its network SNR):
 
 ```
 python generate_fit_input.py \
     --config GWDatasetGeneration/configs/config_BBH.yaml \
     --data   /path/to/background_data \
-    --out    data.h5
+    --out    data.h5 --target-snr 30
 ```
 
 The generator mirrors upstream `injections.py`:
 
-- **SNR reweighting is applied by default.** Each waveform's amplitude
-  is rescaled so the network SNR matches a draw from
-  `config.snr_reweighting` (e.g. `PowerLaw[12,100,-3]` in the BBH
-  config). Pass `--no-reweight` to use the raw distance-implied SNR
-  instead.
+- **SNR reweighting rescales each waveform's amplitude** to hit its
+  target network SNR — a fixed value per sweep step (or `--target-snr`),
+  otherwise a draw from `config.snr_reweighting` (e.g. `PowerLaw[12,100,-3]`
+  in the BBH config). In single-event mode, `--no-reweight` uses the raw
+  distance-implied SNR instead.
 - **Whitening is intentionally skipped.** The matched-filter inner
   product `4 Δf Re Σ d*·h / S_n` already "whitens" both sides via the
   `1/S_n` factor, so the fit needs raw coloured strain + PSD rather
