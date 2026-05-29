@@ -1,12 +1,9 @@
-jax
-jaxlib
-ripplegw
-optax
 h5py
 numpy
 scipy
 matplotlib
 torch
 ml4gw
+gwpy
 pyyaml
 tqdm

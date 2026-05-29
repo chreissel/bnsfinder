@@ -1,9 +1,11 @@
 """Network chirp-mass fit via differentiable matched filtering.
 
-Mirrors the final section of ``FirstTests.ipynb``: builds per-detector
+Mirrors the chirp-mass fit in ``FirstTests.ipynb``: builds per-detector
 matched-filter inputs from a single HDF5 event (the format produced by
 ``generate_fit_input.py``) and gradient-descends on the time-maximised
-network SNR squared.
+network SNR squared. PyTorch autograd differentiates straight through an
+``ml4gw.waveforms.IMRPhenomD`` template -- the same waveform model
+``GWDatasetGeneration`` uses to *make* the injections.
 """
 
 from __future__ import annotations
@@ -12,15 +14,43 @@ import argparse
 from pathlib import Path
 
 import h5py
-import jax
-
-jax.config.update("jax_enable_x64", True)
-
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-import optax
-from ripple.waveforms.IMRPhenomD import gen_IMRPhenomD_hphc
+import torch
+from ml4gw.waveforms import IMRPhenomD
+
+torch.set_default_dtype(torch.float64)
+
+
+# --- Two shims make ml4gw's IMRPhenomD differentiable. It is written for
+# forward evaluation, so a couple of ops have no usable autograd path. ---
+
+# shim 1: torch.heaviside has no gradient rule. ml4gw only uses it to build
+# piecewise-constant PN-region masks, whose derivative is 0 almost
+# everywhere, so a detached version is the correct gradient.
+_orig_heaviside = torch.heaviside
+torch.heaviside = lambda inp, val: _orig_heaviside(inp.detach(), val.detach())
+
+
+# shim 2: phenom_d_mrd_amp does `exp(...) *= ...` in place, which corrupts
+# that exp's backward pass. Re-bind an out-of-place equivalent.
+def _phenom_d_mrd_amp(self, Mf, eta, eta2, chi1, chi2, xi, fRD, fDM):
+    g1 = self.gamma1_fun(eta, eta2, xi)
+    g2 = self.gamma2_fun(eta, eta2, xi)
+    g3 = self.gamma3_fun(eta, eta2, xi)
+    fDMg3 = fDM * g3
+    pow2 = (torch.ones_like(Mf).mT * fDMg3 * fDMg3).mT
+    fminfRD = Mf - (torch.ones_like(Mf).mT * fRD).mT
+    etl = torch.exp(fminfRD.mT * g2 / fDMg3).mT
+    etl = etl * (fminfRD ** 2 + pow2)            # upstream uses `*=` here
+    amp = (1 / etl.mT * g1 * g3 * fDM).mT
+    Damp = (fminfRD.mT * -2 * fDM * g1 * g3) / (
+        fminfRD * fminfRD + pow2
+    ).mT - (g2 * g1)
+    return amp, Damp.mT / etl
+
+
+IMRPhenomD.phenom_d_mrd_amp = _phenom_d_mrd_amp
 
 
 def load_event(path: str) -> dict:
@@ -34,12 +64,12 @@ def load_event(path: str) -> dict:
     return arrays
 
 
-def tukey_window(n: int, alpha: float = 0.01) -> jnp.ndarray:
+def tukey_window(n: int, alpha: float = 0.01) -> torch.Tensor:
     n_taper = int(round(alpha * n / 2))
     if n_taper == 0:
-        return jnp.ones(n)
-    ramp = 0.5 * (1 - jnp.cos(jnp.pi * (jnp.arange(n_taper) + 0.5) / n_taper))
-    return jnp.concatenate([ramp, jnp.ones(n - 2 * n_taper), ramp[::-1]])
+        return torch.ones(n, dtype=torch.float64)
+    ramp = 0.5 * (1 - torch.cos(torch.pi * (torch.arange(n_taper) + 0.5) / n_taper))
+    return torch.cat([ramp, torch.ones(n - 2 * n_taper), ramp.flip(0)])
 
 
 def build_detectors(
@@ -47,67 +77,78 @@ def build_detectors(
     detectors: tuple[str, ...],
     fs: float,
     n: int,
-    band: jnp.ndarray,
+    band: torch.Tensor,
     tukey_alpha: float = 0.01,
 ) -> dict:
+    """Per-detector matched-filter inputs as torch tensors."""
     window_td = tukey_window(n, tukey_alpha)
     out = {}
     for det in detectors:
-        strain = jnp.asarray(arrays[f"{det}/strain"], dtype=jnp.float64)
-        psd = jnp.asarray(arrays[f"{det}/psd"], dtype=jnp.float64)
+        strain = torch.tensor(arrays[f"{det}/strain"], dtype=torch.float64)
+        psd = torch.tensor(arrays[f"{det}/psd"], dtype=torch.float64)
         out[det] = {
-            "d_full": jnp.fft.rfft(strain * window_td) / fs,
-            "psd_safe": jnp.where(band, psd, jnp.inf),
+            "d_full": torch.fft.rfft(strain * window_td) / fs,
+            "psd_safe": torch.where(band, psd, torch.inf),
             "fplus": float(arrays[f"antenna/{det}/fplus"]),
             "fcross": float(arrays[f"antenna/{det}/fcross"]),
         }
     return out
 
 
-def theta_from_truth(arrays: dict) -> jnp.ndarray:
-    """Ripple BBH order: [Mc, eta, chi1, chi2, D, tc, phic, iota]."""
-    q = float(arrays["truth/mass_ratio"])
-    return jnp.array(
-        [
-            float(arrays["truth/chirp_mass"]),
-            q / (1 + q) ** 2,
-            float(arrays["truth/chi1"]),
-            float(arrays["truth/chi2"]),
-            float(arrays["truth/distance"]),
-            float(arrays["truth/tc"]),
-            float(arrays["truth/phic"]),
-            float(arrays["truth/inclination"]),
-        ]
+def fixed_params_from_truth(arrays: dict) -> dict:
+    """Non-mass IMRPhenomD parameters, held fixed at their truth values.
+
+    ml4gw's IMRPhenomD takes ``mass_ratio`` directly (no eta) and has no
+    ``tc`` argument -- the matched filter's max_t absorbs the arrival time.
+    """
+    def _const(v: float) -> torch.Tensor:
+        return torch.tensor([float(v)], dtype=torch.float64)
+
+    return dict(
+        mass_ratio=_const(arrays["truth/mass_ratio"]),
+        chi1=_const(arrays["truth/chi1"]),
+        chi2=_const(arrays["truth/chi2"]),
+        distance=_const(arrays["truth/distance"]),
+        phic=_const(arrays["truth/phic"]),
+        inclination=_const(arrays["truth/inclination"]),
     )
 
 
 def make_loss(
-    theta_fixed: jnp.ndarray,
+    phenom: IMRPhenomD,
+    fixed_params: dict,
     detectors: dict,
-    freqs: jnp.ndarray,
-    band: jnp.ndarray,
+    freqs: torch.Tensor,
+    band: torch.Tensor,
+    band_idx: torch.Tensor,
     df: float,
     fs: float,
     n: int,
     f_ref: float,
 ):
-    """Return ``-(ρ²_H1 + ρ²_L1 + ...)`` as a JIT-compiled value-and-grad fn."""
+    """Return ``-(ρ²_H1 + ρ²_L1 + ...)`` as a differentiable function of Mc.
 
-    def _rho_sq_det(theta: jnp.ndarray, det: dict) -> jnp.ndarray:
-        hp, hc = gen_IMRPhenomD_hphc(freqs[band].astype(jnp.float64), theta, f_ref)
-        h_b = (det["fplus"] * hp + det["fcross"] * hc).astype(jnp.complex128)
-        h = jnp.zeros_like(freqs, dtype=jnp.complex128).at[band].set(h_b)
-        hh = 4.0 * df * jnp.real(jnp.sum(jnp.abs(h) ** 2 / det["psd_safe"]))
-        integrand = jnp.conj(det["d_full"]) * h / det["psd_safe"]
-        pad = jnp.zeros(n, dtype=jnp.complex128).at[: integrand.shape[0]].set(integrand)
-        z = 4.0 * fs * jnp.fft.ifft(pad)
-        return jnp.max(jnp.abs(z) ** 2) / hh
+    Each ρ² is time-maximised with a single inverse FFT, so there is no need
+    to also fit tc: as Mc moves the merger drifts inside the segment and
+    ``max_t`` tracks it automatically.
+    """
 
-    @jax.jit
-    @jax.value_and_grad
-    def loss(mc: jnp.ndarray) -> jnp.ndarray:
-        theta = theta_fixed.at[0].set(mc)
-        return -sum(_rho_sq_det(theta, det) for det in detectors.values())
+    def loss(mc: torch.Tensor) -> torch.Tensor:
+        hc, hp = phenom(freqs[band], chirp_mass=mc, f_ref=f_ref, **fixed_params)
+        rho_sq = mc.new_zeros(())
+        for det in detectors.values():
+            h_band = det["fplus"] * hp[0] + det["fcross"] * hc[0]
+            h = torch.zeros(n // 2 + 1, dtype=torch.complex128).index_put(
+                (band_idx,), h_band
+            )
+            hh = 4.0 * df * torch.sum(torch.abs(h) ** 2 / det["psd_safe"]).real
+            integrand = torch.conj(det["d_full"]) * h / det["psd_safe"]
+            pad = torch.zeros(n, dtype=torch.complex128).index_put(
+                (torch.arange(integrand.shape[0]),), integrand
+            )
+            z = 4.0 * fs * torch.fft.ifft(pad)
+            rho_sq = rho_sq + torch.max(torch.abs(z) ** 2) / hh
+        return -rho_sq
 
     return loss
 
@@ -128,36 +169,41 @@ def fit_network_mc(
     fs = float(arrays.get("__sample_rate__", 4096.0))
     n = arrays[f"{detectors[0]}/strain"].shape[0]
     df = fs / n
-    freqs = jnp.fft.rfftfreq(n, d=1.0 / fs)
+    freqs = torch.fft.rfftfreq(n, d=1.0 / fs)
     f_hi = fs / 2 if f_max is None else f_max
     band = (freqs >= f_min) & (freqs <= f_hi)
+    band_idx = band.nonzero().squeeze()
     f_ref = f_min
 
-    theta_truth = theta_from_truth(arrays)
-    mc_truth = float(theta_truth[0])
+    mc_truth = float(arrays["truth/chirp_mass"])
     if mc_init is None:
         mc_init = mc_truth + mc_offset
 
     det_data = build_detectors(arrays, detectors, fs, n, band, tukey_alpha)
-    loss_fn = make_loss(theta_truth, det_data, freqs, band, df, fs, n, f_ref)
-
-    mc = jnp.float64(mc_init)
-    schedule = optax.cosine_decay_schedule(
-        init_value=lr_init, decay_steps=steps, alpha=lr_final / lr_init
+    phenom = IMRPhenomD()
+    fixed_params = fixed_params_from_truth(arrays)
+    loss_fn = make_loss(
+        phenom, fixed_params, det_data, freqs, band, band_idx, df, fs, n, f_ref
     )
-    opt = optax.adam(schedule)
-    state = opt.init(mc)
+
+    mc = torch.tensor([mc_init], dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.Adam([mc], lr=lr_init)
+    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=steps, eta_min=lr_final
+    )
 
     hist_mc, hist_rho = [], []
     for _ in range(steps):
-        value, grad = loss_fn(mc)
-        hist_mc.append(float(mc))
-        hist_rho.append(float(jnp.sqrt(-value)))
-        if not np.isfinite(grad):
-            print(f"non-finite gradient at Mc = {float(mc):.4f}; stopping")
+        opt.zero_grad()
+        value = loss_fn(mc)
+        value.backward()
+        hist_mc.append(mc.item())
+        hist_rho.append(float(torch.sqrt(-value.detach())))
+        if not torch.isfinite(mc.grad).all():
+            print(f"non-finite gradient at Mc = {mc.item():.4f}; stopping")
             break
-        updates, state = opt.update(grad, state)
-        mc = optax.apply_updates(mc, updates)
+        opt.step()
+        schedule.step()
 
     return {
         "mc_history": np.asarray(hist_mc),

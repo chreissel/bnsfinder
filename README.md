@@ -1,9 +1,10 @@
 # Wavetune
 
-Differential fitting of a [ripple](https://github.com/tedwards2412/ripple)
-gravitational-wave waveform to H1/L1 strain data. The chirp mass is
-recovered by gradient-descending the time-maximised matched-filter SNR
-with JAX + optax; the trajectory in (Mc, ρ) is recorded along the way.
+Differential fitting of an
+[`ml4gw`](https://github.com/ML4GW/ml4gw) `IMRPhenomD` gravitational-wave
+waveform to H1/L1 strain data. The chirp mass is recovered by
+gradient-descending the time-maximised matched-filter SNR with PyTorch
+autograd; the trajectory in (Mc, ρ) is recorded along the way.
 
 Upstream dataset generator
 [`GWDatasetGeneration`](https://github.com/chreissel/GWDatasetGeneration)
@@ -17,10 +18,10 @@ git submodule update --init
 pip install -r requirements.txt
 ```
 
-`ripplegw` pulls in JAX. Install a matching `jax[cuda]` wheel first if
-you want GPU acceleration. `ml4gw` pulls in PyTorch and is only needed
-for the data-generation wrapper (`generate_fit_input.py`), not for the
-fit itself.
+Both the fit and the data-generation wrapper (`generate_fit_input.py`)
+run on `ml4gw` + PyTorch. Install a matching CUDA `torch` wheel first if
+you want GPU acceleration. `gwpy` is used for the time/frequency
+visualisations in the notebook and `scripts/make_data_plots.py`.
 
 ## Input data
 
@@ -82,17 +83,18 @@ frequency sweep ramping up to merger at `truth/tc`:
 
 ## `fit_waveforms.py` — the network fit, scripted
 
-The standalone script reproduces step 8 from the notebook without the
-preceding pedagogy. Internally it:
+The standalone script reproduces the notebook's network chirp-mass fit
+without the preceding pedagogy. Internally it:
 
 - loads the HDF5 event (`load_event`),
 - builds per-detector `(d̃, 1/S_n, F+, F×)` with a Tukey-windowed FFT
   (`build_detectors`, `tukey_window`),
-- builds a ripple parameter vector from `/truth` (`theta_from_truth`),
-- constructs a `jax.jit`-ed `jax.value_and_grad` loss
-  `-(ρ²_H1 + ρ²_L1)` where each per-detector ρ² is time-maximised via
-  one inverse FFT (`make_loss`),
-- runs Adam with a cosine-decayed learning rate (`fit_network_mc`),
+- collects the fixed non-mass `IMRPhenomD` parameters from `/truth`
+  (`fixed_params_from_truth`),
+- constructs a PyTorch loss `-(ρ²_H1 + ρ²_L1)` where each per-detector
+  ρ² is time-maximised via one inverse FFT (`make_loss`), differentiated
+  by autograd through the `ml4gw` waveform,
+- runs Adam with a cosine-annealed learning rate (`fit_network_mc`),
 - and writes a two-panel trajectory plot (`plot_history`).
 
 Usage:
@@ -105,10 +107,10 @@ python fit_waveforms.py \
 ```
 
 Defaults reproduce the notebook's network fit: start `mc_truth + 10`
-Msun off, 500 Adam steps with `lr 0.1 → 1e-3` cosine decay. Only the
-chirp mass is updated; all other ripple parameters are held at their
-truth values. To fit additional parameters, extend `make_loss` in
-`fit_waveforms.py` to return gradients over the full vector.
+Msun off, 500 Adam steps with `lr 0.1 → 1e-3` cosine annealing. Only the
+chirp mass is updated; all other `IMRPhenomD` parameters are held at
+their truth values. To fit additional parameters, make them
+`requires_grad` tensors and extend `make_loss` in `fit_waveforms.py`.
 
 Running on `example_data/data_BBH_highSNR.h5` recovers truth
 (Mc ≈ 32.40 Msun) from a +10 Msun offset and reaches the truth network
@@ -120,9 +122,12 @@ Stdout reports the initial / final / truth (Mc, ρ_net) triple.
 
 ## Notes
 
-- Uses `ripple.waveforms.IMRPhenomD.gen_IMRPhenomD_hphc`. For BNS with
-  tidal effects swap in `IMRPhenomD_NRTidalv2` and extend the parameter
-  vector with `lambda1, lambda2` (and consider TaylorF2 instead).
+- Uses `ml4gw.waveforms.IMRPhenomD`, the same model `GWDatasetGeneration`
+  uses to make the injections. Two small shims (see the top of
+  `fit_waveforms.py` / the notebook's first cell) make it differentiable:
+  a detached `torch.heaviside` and an out-of-place `phenom_d_mrd_amp`.
+  For BNS with tidal effects swap in an `IMRPhenomD_NRTidalv2`-style model
+  and add `lambda1, lambda2`.
 - Matched-filter inner product is `4 Δf Re Σ d*·h / S_n`, assuming a
   one-sided PSD on a uniform frequency grid.
 - The network sum is **incoherent** — each detector's peak is chosen
