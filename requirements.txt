@@ -7,3 +7,9 @@ ml4gw
 gwpy
 pyyaml
 tqdm
+
+# FirstTests.ipynb fits with ripple's JAX IMRPhenomD instead of torch + ml4gw
+jax
+jaxlib
+ripplegw
+optax
