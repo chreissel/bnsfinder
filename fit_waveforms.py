@@ -1,9 +1,9 @@
-"""Network chirp-mass fit via differentiable matched filtering.
+"""Single-detector (L1) chirp-mass fit via differentiable matched filtering.
 
-Mirrors the chirp-mass fit in ``FirstTests.ipynb``: builds per-detector
+Mirrors the chirp-mass fit in ``FirstTests.ipynb``: builds the L1
 matched-filter inputs from a single HDF5 event (the format produced by
 ``generate_fit_input.py``) and gradient-descends on the time-maximised
-network SNR squared. PyTorch autograd differentiates straight through an
+SNR squared. PyTorch autograd differentiates straight through an
 ``ml4gw.waveforms.IMRPhenomD`` template -- the same waveform model
 ``GWDatasetGeneration`` uses to *make* the injections.
 """
@@ -126,7 +126,11 @@ def make_loss(
     n: int,
     f_ref: float,
 ):
-    """Return ``-(ρ²_H1 + ρ²_L1 + ...)`` as a differentiable function of Mc.
+    """Return ``-ρ²_L1`` (single-detector) as a differentiable function of Mc.
+
+    With a one-detector network the loss is just the negative time-maximised
+    SNR² of that detector; the loop below still sums over ``detectors`` so the
+    same code handles a multi-detector network if more are passed in.
 
     Each ρ² is time-maximised with a single inverse FFT, so there is no need
     to also fit tc: as Mc moves the merger drifts inside the segment and
@@ -156,7 +160,7 @@ def make_loss(
 def fit_network_mc(
     arrays: dict,
     *,
-    detectors: tuple[str, ...] = ("H1", "L1"),
+    detectors: tuple[str, ...] = ("L1",),
     mc_init: float | None = None,
     mc_offset: float = 10.0,
     steps: int = 500,
@@ -205,11 +209,18 @@ def fit_network_mc(
         opt.step()
         schedule.step()
 
+    # Truth SNR reference for the recovered statistic: for a single detector
+    # use that detector's stored SNR, otherwise the stored network SNR.
+    if len(detectors) == 1 and f"truth/snr_{detectors[0]}" in arrays:
+        rho_truth = float(arrays[f"truth/snr_{detectors[0]}"])
+    else:
+        rho_truth = float(arrays["truth/snr"])
+
     return {
         "mc_history": np.asarray(hist_mc),
         "rho_history": np.asarray(hist_rho),
         "mc_truth": mc_truth,
-        "rho_truth_net": float(arrays["truth/snr"]),
+        "rho_truth_net": rho_truth,
         "detectors": detectors,
     }
 
@@ -248,11 +259,11 @@ def plot_history(result: dict, out_path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", default="example_data/data_BBH_highSNR.h5",
-                        help="HDF5 event with H1/L1 strain, PSD, antenna, truth.")
+                        help="HDF5 event with L1 strain, PSD, antenna, truth.")
     parser.add_argument("--out", default="fit_history.png",
                         help="Where to write the SNR-vs-Mc trajectory plot.")
-    parser.add_argument("--detectors", nargs="+", default=["H1", "L1"],
-                        help="Detectors to include in the network sum.")
+    parser.add_argument("--detectors", nargs="+", default=["L1"],
+                        help="Detectors to include in the fit (default: L1 only).")
     parser.add_argument("--mc-init", type=float, default=None,
                         help="Starting chirp mass [Msun]. Defaults to truth + --mc-offset.")
     parser.add_argument("--mc-offset", type=float, default=10.0,

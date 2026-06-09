@@ -2,9 +2,9 @@
 
 Reads ``example_data/data_BBH_highSNR.h5`` and writes:
 
-* ``plots/strain_timeseries.png`` — raw H1/L1 strain (signal + O3a noise)
-* ``plots/psd.png`` — one-sided amplitude spectral densities
-* ``plots/whitened_qtransform.png`` — whitened, band-passed H1 strain plus
+* ``plots/strain_timeseries.png`` — raw L1 strain (signal + O3a noise)
+* ``plots/psd.png`` — one-sided amplitude spectral density
+* ``plots/whitened_qtransform.png`` — whitened, band-passed L1 strain plus
   its Q-transform around the merger
 """
 
@@ -22,7 +22,8 @@ DATA = Path("example_data/data_BBH_highSNR.h5")
 OUT = Path("plots")
 OUT.mkdir(exist_ok=True)
 
-COLOR = {"H1": "#ee0000", "L1": "#4ba6ff"}
+COLOR = {"L1": "#4ba6ff"}
+DETECTORS = ("L1",)
 
 
 def load() -> dict:
@@ -39,10 +40,12 @@ def load() -> dict:
 
 
 def strain_plot(arrays: dict, fs: float) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
-    n = arrays["H1/strain"].shape[0]
+    fig, axes = plt.subplots(len(DETECTORS), 1, figsize=(10, 3), sharex=True,
+                             squeeze=False)
+    axes = axes[:, 0]
+    n = arrays[f"{DETECTORS[0]}/strain"].shape[0]
     t = np.arange(n) / fs
-    for ax, det in zip(axes, ("H1", "L1")):
+    for ax, det in zip(axes, DETECTORS):
         ax.plot(t, arrays[f"{det}/strain"], color=COLOR[det], lw=0.6)
         ax.set_ylabel(f"{det} strain")
         ax.grid(alpha=0.3)
@@ -54,11 +57,11 @@ def strain_plot(arrays: dict, fs: float) -> None:
 
 
 def psd_plot(arrays: dict, fs: float) -> None:
-    n = arrays["H1/strain"].shape[0]
+    n = arrays[f"{DETECTORS[0]}/strain"].shape[0]
     df = fs / n
     freqs = np.fft.rfftfreq(n, d=1.0 / fs)
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    for det in ("H1", "L1"):
+    for det in DETECTORS:
         ax.loglog(freqs, np.sqrt(arrays[f"{det}/psd"]),
                   color=COLOR[det], label=f"{det} ASD")
     ax.set_xlim(10, fs / 2)
@@ -73,7 +76,7 @@ def psd_plot(arrays: dict, fs: float) -> None:
     plt.close(fig)
 
 
-def whitened_qtransform(arrays: dict, fs: float, det: str = "H1") -> None:
+def whitened_qtransform(arrays: dict, fs: float, det: str = "L1") -> None:
     n = arrays[f"{det}/strain"].shape[0]
     ts = TimeSeries(arrays[f"{det}/strain"], t0=0, sample_rate=fs)
     asd = FrequencySeries(arrays[f"{det}/psd"], f0=0, df=fs / n) ** 0.5
@@ -115,7 +118,7 @@ def main() -> None:
     fs = float(attrs.get("sample_rate", 4096.0))
     strain_plot(arrays, fs)
     psd_plot(arrays, fs)
-    whitened_qtransform(arrays, fs, det="H1")
+    whitened_qtransform(arrays, fs, det="L1")
     print("Wrote:", *(p.name for p in sorted(OUT.glob("*.png"))))
 
 
