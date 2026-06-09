@@ -4,8 +4,8 @@ Upstream `GWDatasetGeneration/main.py` writes *whitened* time series plus
 sampled parameters per batch in `sig_{i}.h5` / `bkg_{i}.h5`. The
 differential fit in `fit_waveform.py` instead needs, for a single event:
 
-    - Raw (un-whitened) detector strain time series for H1 and L1
-    - One-sided PSD per detector on the rFFT grid of that time series
+    - Raw (un-whitened) detector strain time series for L1
+    - One-sided PSD for L1 on the rFFT grid of that time series
     - Antenna-pattern factors (F+, Fx) that were applied to the injection
 
 This script reuses the waveform generation path from `GWDatasetGeneration`
@@ -85,7 +85,11 @@ def generate(
     # Force single-event generation regardless of the config's batch_size.
     config.general.batch_size = 1
 
-    ifos = list(config.general.ifos)
+    # Run for a single detector (L1) only, regardless of the config's ifos.
+    # The background loader, antenna response and SNR helpers below all work
+    # unchanged with a one-element ifo list, so the written event contains
+    # just L1 strain/PSD/antenna and a single-detector truth SNR.
+    ifos = ["L1"]
     fs = int(config.general.sample_rate)
     f_min = float(config.general.f_min)
     f_max = float(getattr(config.general, "f_max", fs / 2.0))
